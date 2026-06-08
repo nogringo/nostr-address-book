@@ -1,39 +1,55 @@
-<!--
-This README describes the package. If you publish this package to pub.dev,
-this README's contents appear on the landing page for your package.
+# Nostr Address Book
 
-For information about how to write a good package README, see the guide for
-[writing package pages](https://dart.dev/tools/pub/writing-package-pages).
+Local-first Dart package for portable private Nostr address books.
 
-For general information about developing packages, see the Dart guide for
-[creating packages](https://dart.dev/tools/pub/create-packages)
-and the Flutter guide for
-[developing packages and plugins](https://flutter.dev/to/develop-packages).
--->
+Contacts are stored as vCard 4.0 payloads in addressable Nostr events:
 
-TODO: Put a short description of the package here that helps potential users
-know whether this package might be useful for them.
-
-## Features
-
-TODO: List what your package can do. Maybe include images, gifs, or videos.
-
-## Getting started
-
-TODO: List prerequisites and provide or point to information on how to
-start using the package.
+- kind `38522`
+- `d` tag equal to the vCard `UID`
+- NIP-44 self-encrypted content by default
+- NIP-09 deletion events for removals
 
 ## Usage
 
-TODO: Include short and useful examples for package users. Add longer examples
-to `/example` folder.
-
 ```dart
-const like = 'sample';
+final book = NostrAddressBook(
+  ndk: ndk,
+  database: database,
+);
+
+await book.fetchRecent();
+await book.pull(paginate: true);
+
+await book.upsertVCard(vcardText);
+await book.delete(uid);
+
+final contacts = await book.list();
+final stream = book.watchAll();
+
+await book.rebuildComputedStores();
+
+book.broadcastQueue.retryNow();
+book.broadcastQueue.start();
+
+await book.dispose();
 ```
 
-## Additional information
+`NostrAddressBook` uses `ndk.accounts` for signing and encryption. Local reads,
+watchers, and computed-store rebuilds do not require a signer.
 
-TODO: Tell users more about the package: where to find more information, how to
-contribute to the package, how to file issues, what response they can expect
-from the package authors, and more.
+Network fetches resolve the current user's NIP-65 read relays through
+`ndk.userRelayLists` and pass them explicitly to `ndk.requests.query`.
+Publishing resolves NIP-65 write relays the same way before queueing events in
+`broadcastQueue`.
+
+## Storage
+
+The package keeps raw and computed data separate:
+
+- NDK cache: encrypted Nostr events.
+- `address_book_decrypted_events`: `eventId -> decryptedText`.
+- `address_book_contacts`, `address_book_contact_index`, and
+  `address_book_uid_events`: computed stores that can be dropped and rebuilt.
+
+`rebuildComputedStores()` reconstructs contacts from the NDK cache and decrypted
+event store without internet or signer access.

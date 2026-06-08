@@ -1,15 +1,25 @@
 name: nostr_address_book
-description: A starting point for Dart libraries or applications.
-version: 1.0.0
-# repository: https://github.com/my_org/my_repo
+description: Local-first Nostr address book backed by vCard 4.0 events.
+version: 0.1.0
+repository: https://github.com/nogringo/nostr-address-book
+
+topics:
+  - nostr
+  - address-book
+  - vcard
+  - offline-first
 
 environment:
   sdk: ^3.12.1
 
-# Add regular dependencies here.
 dependencies:
-  # path: ^1.9.0
+  broadcast_queue_shim_for_ndk: ^0.2.1
+  ndk: ^0.8.4-dev.2
+  sembast: ^3.8.8+1
+  uuid: ^4.5.3
+  vcard_dart: ^2.1.0
 
 dev_dependencies:
+  bip340: ^0.3.1
   lints: ^6.0.0
   test: ^1.25.6
