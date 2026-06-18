@@ -1,6 +1,6 @@
 name: nostr_address_book
 description: Local-first Nostr address book backed by vCard 4.0 events.
-version: 0.1.0
+version: 0.1.1
 repository: https://github.com/nogringo/nostr-address-book
 
 topics:

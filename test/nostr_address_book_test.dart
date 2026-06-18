@@ -162,6 +162,42 @@ void main() {
         unorderedEquals(['wss://write.example', 'wss://both.example']),
       );
     });
+
+    test('upsert and delete queue signed events for broadcast', () async {
+      final relay = MockRelay(name: 'signed queue relay');
+      await relay.startServer();
+      try {
+        const uid = 'urn:uuid:signed-queue';
+        await ndk.config.cache.saveUserRelayList(
+          ndk_entities.UserRelayList(
+            pubKey: signer.getPublicKey(),
+            relays: {relay.url: ndk_entities.ReadWriteMarker.writeOnly},
+            createdAt: 100,
+            refreshedTimestamp: 100,
+          ),
+        );
+
+        final contact = await book.upsertVCard(
+          _vcard(uid: uid, name: 'Signed Queue'),
+        );
+        final queued = await book.broadcastQueue.get(contact.eventId);
+
+        expect(queued, isNotNull);
+        expect(queued!.event.sig, isNotNull);
+        expect(queued.event.sig, isNotEmpty);
+
+        await book.delete(uid);
+        final queuedEvents = await book.broadcastQueue.listAll();
+        final queuedDeletion = queuedEvents.singleWhere(
+          (entry) => entry.event.kind == NostrAddressBook.deletionKind,
+        );
+
+        expect(queuedDeletion.event.sig, isNotNull);
+        expect(queuedDeletion.event.sig, isNotEmpty);
+      } finally {
+        await relay.stopServer();
+      }
+    });
   });
 
   group('network fetch', () {

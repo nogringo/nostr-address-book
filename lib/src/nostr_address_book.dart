@@ -130,14 +130,16 @@ class NostrAddressBook {
     }
 
     final now = Nip01Event.secondsSinceEpoch();
-    final event = Nip01Event(
-      pubKey: account.pubkey,
-      kind: contactKind,
-      tags: [
-        ['d', canonical.uid],
-      ],
-      content: encrypted,
-      createdAt: now,
+    final event = await account.signer.sign(
+      Nip01Event(
+        pubKey: account.pubkey,
+        kind: contactKind,
+        tags: [
+          ['d', canonical.uid],
+        ],
+        content: encrypted,
+        createdAt: now,
+      ),
     );
 
     await ndk.config.cache.saveEvent(event);
@@ -167,16 +169,18 @@ class NostrAddressBook {
     if (contact == null || contact.deleted) return;
 
     final now = Nip01Event.secondsSinceEpoch();
-    final event = Nip01Event(
-      pubKey: account.pubkey,
-      kind: deletionKind,
-      tags: [
-        ['e', contact.eventId],
-        ['a', '$contactKind:${account.pubkey}:$uid'],
-        ['k', contactKind.toString()],
-      ],
-      content: reason,
-      createdAt: now,
+    final event = await account.signer.sign(
+      Nip01Event(
+        pubKey: account.pubkey,
+        kind: deletionKind,
+        tags: [
+          ['e', contact.eventId],
+          ['a', '$contactKind:${account.pubkey}:$uid'],
+          ['k', contactKind.toString()],
+        ],
+        content: reason,
+        createdAt: now,
+      ),
     );
     await ndk.config.cache.saveEvent(event);
 
