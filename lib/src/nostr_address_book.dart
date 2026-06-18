@@ -48,7 +48,7 @@ class NostrAddressBook {
   ///
   /// This is intended as a quick startup refresh. It queries contacts and
   /// NIP-09 deletions with [recentLimit] and does not paginate. Queries are
-  /// sent explicitly to [readRelays].
+  /// sent explicitly to [getReadRelays].
   Future<AddressBookSyncResult> fetchRecent() {
     return _fetch(
       contactFilter: contactFilter(limit: recentLimit),
@@ -62,7 +62,7 @@ class NostrAddressBook {
   /// The list comes from the current account NIP-65 read relays through
   /// `ndk.userRelayLists`. If no read relay is available, the method falls
   /// back explicitly to currently connected relays, then NDK bootstrap relays.
-  Future<List<String>> readRelays({bool forceRefresh = false}) async {
+  Future<List<String>> getReadRelays({bool forceRefresh = false}) async {
     final pubkey = _requirePubkey();
     final userRelayList = await ndk.userRelayLists.getSingleUserRelayList(
       pubkey,
@@ -76,7 +76,7 @@ class NostrAddressBook {
   /// The list comes from the current account NIP-65 write relays through
   /// `ndk.userRelayLists`. If no write relay is available, the method falls
   /// back explicitly to currently connected relays, then NDK bootstrap relays.
-  Future<List<String>> writeRelays({bool forceRefresh = false}) async {
+  Future<List<String>> getWriteRelays({bool forceRefresh = false}) async {
     final pubkey = _requirePubkey();
     final userRelayList = await ndk.userRelayLists.getSingleUserRelayList(
       pubkey,
@@ -144,7 +144,7 @@ class NostrAddressBook {
     await _store.saveDecryptedEvent(event.id, canonical.text);
     await rebuildComputedStores();
 
-    final relays = await writeRelays();
+    final relays = await getWriteRelays();
     if (relays.isNotEmpty) {
       await broadcastQueue.broadcast(event, relays: relays);
     }
@@ -180,7 +180,7 @@ class NostrAddressBook {
     );
     await ndk.config.cache.saveEvent(event);
 
-    final relays = await writeRelays();
+    final relays = await getWriteRelays();
     if (relays.isNotEmpty) {
       await broadcastQueue.broadcast(event, relays: relays);
     }
@@ -321,7 +321,7 @@ class NostrAddressBook {
     bool useFetchedRanges = false,
   }) async {
     final account = _requireAccount();
-    final relays = await readRelays();
+    final relays = await getReadRelays();
     final contactEvents = await _queryContacts(
       contactFilter,
       relays: relays,

@@ -1,5 +1,3 @@
-// ignore_for_file: prefer_initializing_formals
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:developer';
@@ -102,8 +100,11 @@ class MockRelay {
       _nip85Assertions = nip85Assertions;
     }
 
-    var server = await HttpServer.bind(InternetAddress.loopbackIPv4, _port!,
-        shared: true);
+    var server = await HttpServer.bind(
+      InternetAddress.loopbackIPv4,
+      _port!,
+      shared: true,
+    );
     this.server = server;
     var stream = server.transform(WebSocketTransformer());
 
@@ -111,193 +112,237 @@ class MockRelay {
     final String challenge = Helpers.getRandomString(10);
     Set<String> authenticatedPubkeys = {};
 
-    stream.listen((webSocket) {
-      // Register this client
-      _clientSubscriptions[webSocket] = {};
+    stream.listen(
+      (webSocket) {
+        // Register this client
+        _clientSubscriptions[webSocket] = {};
 
-      if (customWelcomeMessage != null) {
-        webSocket.add(customWelcomeMessage!);
-      }
-      if ((requireAuthForRequests || requireAuthForEvents) &&
-          sendAuthChallenge) {
-        webSocket.add(jsonEncode(["AUTH", challenge]));
-      }
-      webSocket.listen((message) async {
-        if (allwaysSendBadJson) {
-          webSocket.add('{"bad_json":,}');
-          return;
+        if (customWelcomeMessage != null) {
+          webSocket.add(customWelcomeMessage!);
         }
-        if (delayResponse != null) {
-          await Future.delayed(delayResponse);
+        if ((requireAuthForRequests || requireAuthForEvents) &&
+            sendAuthChallenge) {
+          webSocket.add(jsonEncode(["AUTH", challenge]));
         }
-        if (message == "ping") {
-          webSocket.add("pong");
-          return;
-        }
-        var eventJson = json.decode(message);
-
-        if (eventJson[0] == "AUTH") {
-          Nip01Event event = Nip01EventModel.fromJson(eventJson[1]);
-          bool authSuccess = false;
-          if (verify(event.pubKey, event.id, event.sig!)) {
-            String? relay = event.getFirstTag("relay");
-            String? eventChallenge = event.getFirstTag("challenge");
-            if (eventChallenge == challenge && relay == url) {
-              authenticatedPubkeys.add(event.pubKey);
-              authSuccess = true;
-            }
-          }
-
-          webSocket.add(jsonEncode([
-            "OK",
-            event.id,
-            authSuccess,
-            authSuccess ? "" : "auth-required: authentication failed"
-          ]));
-          return;
-        }
-        if (eventJson[0] == "EVENT") {
-          Nip01Event newEvent = Nip01EventModel.fromJson(eventJson[1]);
-          if (verify(newEvent.pubKey, newEvent.id, newEvent.sig!)) {
-            // Check auth for events if required (any authenticated user is OK)
-            if (requireAuthForEvents && authenticatedPubkeys.isEmpty) {
-              webSocket.add(jsonEncode([
-                "OK",
-                newEvent.id,
-                false,
-                "auth-required: we only accept events from authenticated users"
-              ]));
+        webSocket.listen(
+          (message) async {
+            if (allwaysSendBadJson) {
+              webSocket.add('{"bad_json":,}');
               return;
             }
-            if (newEvent.kind == ContactList.kKind) {
-              final existing = _contactLists[newEvent.pubKey];
-              if (existing == null || _shouldReplace(existing, newEvent)) {
-                _contactLists[newEvent.pubKey] = newEvent;
-              }
-            } else if (newEvent.kind == Metadata.kKind) {
-              final existing = _metadatas[newEvent.pubKey];
-              if (existing == null || _shouldReplace(existing, newEvent)) {
-                _metadatas[newEvent.pubKey] = newEvent;
-              }
-            } else if (newEvent.kind == Deletion.kKind) {
-              final eventIdsToDelete = newEvent.getTags("e");
-              for (final idToDelete in eventIdsToDelete) {
-                _storedEvents.removeWhere((e) => idToDelete == e.id);
-                // remove from textNotes map
-                if (textNotes != null) {
-                  textNotes.removeWhere((key, event) => event.id == idToDelete);
+            if (delayResponse != null) {
+              await Future.delayed(delayResponse);
+            }
+            if (message == "ping") {
+              webSocket.add("pong");
+              return;
+            }
+            var eventJson = json.decode(message);
+
+            if (eventJson[0] == "AUTH") {
+              Nip01Event event = Nip01EventModel.fromJson(eventJson[1]);
+              bool authSuccess = false;
+              if (verify(event.pubKey, event.id, event.sig!)) {
+                String? relay = event.getFirstTag("relay");
+                String? eventChallenge = event.getFirstTag("challenge");
+                if (eventChallenge == challenge && relay == url) {
+                  authenticatedPubkeys.add(event.pubKey);
+                  authSuccess = true;
                 }
-                //remove from contact lists and metadata
-                _contactLists
-                    .removeWhere((key, event) => event.id == idToDelete);
-                _metadatas.removeWhere((key, event) => event.id == idToDelete);
               }
-            } else if (_isEphemeralKind(newEvent.kind)) {
-              // Ephemeral events (kinds 20000-29999) are broadcast but NOT stored
-              _broadcastEventToSubscriptions(newEvent);
-              // Also handle NIP-46 if targeting our mock signer
-              if (newEvent.kind == kNip46Kind) {
-                _handleNip46Request(newEvent, webSocket);
-              }
-            } else if (_isReplaceableKind(newEvent.kind)) {
-              // NIP-01 replaceable: only one event per (pubkey, kind)
-              final existing = _storedEvents.where((e) =>
-                  e.pubKey == newEvent.pubKey && e.kind == newEvent.kind);
-              if (existing.isEmpty) {
-                _storedEvents.add(newEvent);
-              } else {
-                final current = existing.first;
-                if (_shouldReplace(current, newEvent)) {
-                  _storedEvents.remove(current);
+
+              webSocket.add(
+                jsonEncode([
+                  "OK",
+                  event.id,
+                  authSuccess,
+                  authSuccess ? "" : "auth-required: authentication failed",
+                ]),
+              );
+              return;
+            }
+            if (eventJson[0] == "EVENT") {
+              Nip01Event newEvent = Nip01EventModel.fromJson(eventJson[1]);
+              if (verify(newEvent.pubKey, newEvent.id, newEvent.sig!)) {
+                bool shouldBroadcastToSubscriptions = true;
+
+                // Check auth for events if required (any authenticated user is OK)
+                if (requireAuthForEvents && authenticatedPubkeys.isEmpty) {
+                  webSocket.add(
+                    jsonEncode([
+                      "OK",
+                      newEvent.id,
+                      false,
+                      "auth-required: we only accept events from authenticated users",
+                    ]),
+                  );
+                  return;
+                }
+                if (newEvent.kind == ContactList.kKind) {
+                  final existing = _contactLists[newEvent.pubKey];
+                  if (existing == null || _shouldReplace(existing, newEvent)) {
+                    _contactLists[newEvent.pubKey] = newEvent;
+                  } else {
+                    shouldBroadcastToSubscriptions = false;
+                  }
+                } else if (newEvent.kind == Metadata.kKind) {
+                  final existing = _metadatas[newEvent.pubKey];
+                  if (existing == null || _shouldReplace(existing, newEvent)) {
+                    _metadatas[newEvent.pubKey] = newEvent;
+                  } else {
+                    shouldBroadcastToSubscriptions = false;
+                  }
+                } else if (newEvent.kind == Deletion.kKind) {
+                  final eventIdsToDelete = newEvent.getTags("e");
+                  for (final idToDelete in eventIdsToDelete) {
+                    _storedEvents.removeWhere((e) => idToDelete == e.id);
+                    // remove from textNotes map
+                    if (textNotes != null) {
+                      textNotes.removeWhere(
+                        (key, event) => event.id == idToDelete,
+                      );
+                    }
+                    //remove from contact lists and metadata
+                    _contactLists.removeWhere(
+                      (key, event) => event.id == idToDelete,
+                    );
+                    _metadatas.removeWhere(
+                      (key, event) => event.id == idToDelete,
+                    );
+                  }
+                } else if (_isEphemeralKind(newEvent.kind)) {
+                  // Ephemeral events (kinds 20000-29999) are broadcast but NOT stored
+                  // Also handle NIP-46 if targeting our mock signer
+                  if (newEvent.kind == kNip46Kind) {
+                    _handleNip46Request(newEvent, webSocket);
+                  }
+                } else if (_isReplaceableKind(newEvent.kind)) {
+                  // NIP-01 replaceable: only one event per (pubkey, kind)
+                  final existing = _storedEvents.where(
+                    (e) =>
+                        e.pubKey == newEvent.pubKey && e.kind == newEvent.kind,
+                  );
+                  if (existing.isEmpty) {
+                    _storedEvents.add(newEvent);
+                  } else {
+                    final current = existing.first;
+                    if (_shouldReplace(current, newEvent)) {
+                      _storedEvents.remove(current);
+                      _storedEvents.add(newEvent);
+                    } else {
+                      shouldBroadcastToSubscriptions = false;
+                    }
+                  }
+                } else if (_isAddressableKind(newEvent.kind)) {
+                  // NIP-01 addressable: only one event per (pubkey, kind, d-tag)
+                  final dTag = newEvent.getDtag() ?? '';
+                  final existing = _storedEvents.where(
+                    (e) =>
+                        e.pubKey == newEvent.pubKey &&
+                        e.kind == newEvent.kind &&
+                        (e.getDtag() ?? '') == dTag,
+                  );
+                  if (existing.isEmpty) {
+                    _storedEvents.add(newEvent);
+                  } else {
+                    final current = existing.first;
+                    if (_shouldReplace(current, newEvent)) {
+                      _storedEvents.remove(current);
+                      _storedEvents.add(newEvent);
+                    } else {
+                      shouldBroadcastToSubscriptions = false;
+                    }
+                  }
+                } else {
                   _storedEvents.add(newEvent);
                 }
-              }
-            } else if (_isAddressableKind(newEvent.kind)) {
-              // NIP-01 addressable: only one event per (pubkey, kind, d-tag)
-              final dTag = newEvent.getDtag() ?? '';
-              final existing = _storedEvents.where((e) =>
-                  e.pubKey == newEvent.pubKey &&
-                  e.kind == newEvent.kind &&
-                  (e.getDtag() ?? '') == dTag);
-              if (existing.isEmpty) {
-                _storedEvents.add(newEvent);
+                if (shouldBroadcastToSubscriptions) {
+                  _broadcastEventToSubscriptions(newEvent);
+                }
+                webSocket.add(jsonEncode(["OK", newEvent.id, true, ""]));
               } else {
-                final current = existing.first;
-                if (_shouldReplace(current, newEvent)) {
-                  _storedEvents.remove(current);
-                  _storedEvents.add(newEvent);
+                webSocket.add(
+                  jsonEncode(["OK", newEvent.id, false, "invalid signature"]),
+                );
+              }
+              return;
+            }
+
+            if (eventJson[0] == "REQ") {
+              String requestId = eventJson[1];
+              List<Filter> filters = [];
+              if (eventJson.length > 2) {
+                for (int i = 2; i < eventJson.length; i++) {
+                  if (eventJson[i] is Map<String, dynamic>) {
+                    try {
+                      filters.add(Filter.fromMap(eventJson[i]));
+                    } catch (e) {
+                      log(
+                        "MockRelay: Error parsing filter item in REQ: ${eventJson[i]}, error: $e",
+                      );
+                    }
+                  } else {
+                    log(
+                      "MockRelay: Malformed filter item in REQ (not a Map): ${eventJson[i]}",
+                    );
+                  }
                 }
               }
-            } else {
-              _storedEvents.add(newEvent);
-            }
-            webSocket.add(jsonEncode(["OK", newEvent.id, true, ""]));
-          } else {
-            webSocket.add(
-                jsonEncode(["OK", newEvent.id, false, "invalid signature"]));
-          }
-          return;
-        }
 
-        if (eventJson[0] == "REQ") {
-          String requestId = eventJson[1];
-          List<Filter> filters = [];
-          if (eventJson.length > 2) {
-            for (int i = 2; i < eventJson.length; i++) {
-              if (eventJson[i] is Map<String, dynamic>) {
-                try {
-                  filters.add(Filter.fromMap(eventJson[i]));
-                } catch (e) {
-                  log("MockRelay: Error parsing filter item in REQ: ${eventJson[i]}, error: $e");
-                }
-              } else {
-                log("MockRelay: Malformed filter item in REQ (not a Map): ${eventJson[i]}");
+              // Check auth: any authenticated user can access all data
+              if (requireAuthForRequests && authenticatedPubkeys.isEmpty) {
+                webSocket.add(
+                  jsonEncode([
+                    "CLOSED",
+                    requestId,
+                    "auth-required: we can't serve requests to unauthenticated users",
+                  ]),
+                );
+                return;
               }
+
+              if (filters.isNotEmpty) {
+                // Store the subscription for this client
+                _clientSubscriptions[webSocket]?[requestId] = filters;
+                _respondToRequest(webSocket, filters, requestId);
+              } else {
+                // If no valid filters are provided, send EOSE immediately for this request ID
+                log(
+                  "MockRelay: No valid filters provided for REQ $requestId, sending EOSE.",
+                );
+                webSocket.add(jsonEncode(["EOSE", requestId]));
+              }
+              return;
             }
-          }
 
-          // Check auth: any authenticated user can access all data
-          if (requireAuthForRequests && authenticatedPubkeys.isEmpty) {
-            webSocket.add(jsonEncode([
-              "CLOSED",
-              requestId,
-              "auth-required: we can't serve requests to unauthenticated users"
-            ]));
-            return;
-          }
-
-          if (filters.isNotEmpty) {
-            // Store the subscription for this client
-            _clientSubscriptions[webSocket]?[requestId] = filters;
-            _respondToRequest(webSocket, filters, requestId);
-          } else {
-            // If no valid filters are provided, send EOSE immediately for this request ID
-            log("MockRelay: No valid filters provided for REQ $requestId, sending EOSE.");
-            webSocket.add(jsonEncode(["EOSE", requestId]));
-          }
-          return;
-        }
-
-        if (eventJson[0] == "CLOSE") {
-          String subscriptionId = eventJson[1];
-          // Remove the subscription for this client
-          if (_clientSubscriptions[webSocket]?.containsKey(subscriptionId) ??
-              false) {
-            _clientSubscriptions[webSocket]?.remove(subscriptionId);
-            log("MockRelay: Closed subscription $subscriptionId");
-          } else {
-            log("MockRelay: Attempted to close non-existent subscription $subscriptionId");
-          }
-          return;
-        }
-      }, onDone: () {
-        // Clean up when client disconnects
-        _clientSubscriptions.remove(webSocket);
-        log("MockRelay: Client disconnected");
-      });
-    }, onError: (error) {
-      log('Error: $error');
-    });
+            if (eventJson[0] == "CLOSE") {
+              String subscriptionId = eventJson[1];
+              // Remove the subscription for this client
+              if (_clientSubscriptions[webSocket]?.containsKey(
+                    subscriptionId,
+                  ) ??
+                  false) {
+                _clientSubscriptions[webSocket]?.remove(subscriptionId);
+                log("MockRelay: Closed subscription $subscriptionId");
+              } else {
+                log(
+                  "MockRelay: Attempted to close non-existent subscription $subscriptionId",
+                );
+              }
+              return;
+            }
+          },
+          onDone: () {
+            // Clean up when client disconnects
+            _clientSubscriptions.remove(webSocket);
+            log("MockRelay: Client disconnected");
+          },
+        );
+      },
+      onError: (error) {
+        log('Error: $error');
+      },
+    );
 
     log('Listening on localhost:${server.port}');
     myPromise.complete();
@@ -306,7 +351,10 @@ class MockRelay {
   }
 
   void _respondToRequest(
-      WebSocket webSocket, List<Filter> filters, String requestId) {
+    WebSocket webSocket,
+    List<Filter> filters,
+    String requestId,
+  ) {
     if (sendMalformedEvents) {
       final malformedEventJson =
           '["EVENT", "$requestId", {"id":null,"pubkey":null,"created_at":${DateTime.now().millisecondsSinceEpoch ~/ 1000},"kind":0,"tags":[],"content":null,"sig":null}]';
@@ -325,61 +373,78 @@ class MockRelay {
           filter.kinds!.contains(ContactList.kKind) &&
           filter.authors != null &&
           filter.authors!.isNotEmpty) {
-        eventsForThisFilter.addAll(_contactLists.values
-            .where((e) =>
-                filter.authors!.contains(e.pubKey) &&
-                _matchesTimeFilter(e, filter))
-            .toList());
+        eventsForThisFilter.addAll(
+          _contactLists.values
+              .where(
+                (e) =>
+                    filter.authors!.contains(e.pubKey) &&
+                    _matchesTimeFilter(e, filter),
+              )
+              .toList(),
+        );
       }
       // Match against metadatas
       else if (filter.kinds != null &&
           filter.kinds!.contains(Metadata.kKind) &&
           filter.authors != null &&
           filter.authors!.isNotEmpty) {
-        eventsForThisFilter.addAll(_metadatas.values
-            .where((e) =>
-                filter.authors!.contains(e.pubKey) &&
-                _matchesTimeFilter(e, filter))
-            .toList());
+        eventsForThisFilter.addAll(
+          _metadatas.values
+              .where(
+                (e) =>
+                    filter.authors!.contains(e.pubKey) &&
+                    _matchesTimeFilter(e, filter),
+              )
+              .toList(),
+        );
       }
       // Match against NIP-85 assertions (kinds 30382-30385)
       else if (filter.kinds != null &&
           filter.kinds!.any((k) => k >= 30382 && k <= 30385) &&
           filter.authors != null &&
           filter.authors!.isNotEmpty) {
-        eventsForThisFilter.addAll(_nip85Assertions.values.where((e) {
-          bool kindMatches = filter.kinds!.contains(e.kind);
-          bool authorMatches = filter.authors!.contains(e.pubKey);
-          bool dTagMatches = filter.dTags == null ||
-              filter.dTags!.isEmpty ||
-              filter.dTags!.contains(e.getDtag());
-          return kindMatches && authorMatches && dTagMatches;
-        }).toList());
+        eventsForThisFilter.addAll(
+          _nip85Assertions.values.where((e) {
+            bool kindMatches = filter.kinds!.contains(e.kind);
+            bool authorMatches = filter.authors!.contains(e.pubKey);
+            bool dTagMatches =
+                filter.dTags == null ||
+                filter.dTags!.isEmpty ||
+                filter.dTags!.contains(e.getDtag());
+            return kindMatches && authorMatches && dTagMatches;
+          }).toList(),
+        );
       }
       // General event matching (storedEvents and textNotes)
       else {
-        eventsForThisFilter.addAll(_storedEvents.where((event) {
-          bool kindMatches =
-              filter.kinds == null || filter.kinds!.contains(event.kind);
-          bool authorMatches =
-              filter.authors == null || filter.authors!.contains(event.pubKey);
-          bool idsMatches =
-              filter.ids == null || filter.ids!.contains(event.id);
-          bool timeMatches = _matchesTimeFilter(event, filter);
-          return kindMatches && authorMatches && idsMatches && timeMatches;
-        }).toList());
-
-        if (textNotes != null) {
-          eventsForThisFilter.addAll(textNotes!.values.where((event) {
+        eventsForThisFilter.addAll(
+          _storedEvents.where((event) {
             bool kindMatches =
                 filter.kinds == null || filter.kinds!.contains(event.kind);
-            bool authorMatches = filter.authors == null ||
+            bool authorMatches =
+                filter.authors == null ||
                 filter.authors!.contains(event.pubKey);
             bool idsMatches =
                 filter.ids == null || filter.ids!.contains(event.id);
             bool timeMatches = _matchesTimeFilter(event, filter);
             return kindMatches && authorMatches && idsMatches && timeMatches;
-          }).toList());
+          }).toList(),
+        );
+
+        if (textNotes != null) {
+          eventsForThisFilter.addAll(
+            textNotes!.values.where((event) {
+              bool kindMatches =
+                  filter.kinds == null || filter.kinds!.contains(event.kind);
+              bool authorMatches =
+                  filter.authors == null ||
+                  filter.authors!.contains(event.pubKey);
+              bool idsMatches =
+                  filter.ids == null || filter.ids!.contains(event.id);
+              bool timeMatches = _matchesTimeFilter(event, filter);
+              return kindMatches && authorMatches && idsMatches && timeMatches;
+            }).toList(),
+          );
         }
       }
 
@@ -389,15 +454,17 @@ class MockRelay {
           if (filter.authors != null &&
               filter.authors!.contains(entry.key.publicKey) &&
               (filter.kinds == null || filter.kinds!.contains(Nip65.kKind))) {
-            Nip01Event eventToAdd =
-                entry.value.toEvent(); // Creates a new event instance
+            Nip01Event eventToAdd = entry.value
+                .toEvent(); // Creates a new event instance
             if (!_matchesTimeFilter(eventToAdd, filter)) continue;
             final Nip01Event? eventToAddSigned;
             if (signEvents && entry.key.privateKey != null) {
               // Sign the new instance, not the one in _nip65s
 
               eventToAddSigned = Nip01Utils.signWithPrivateKey(
-                  event: eventToAdd, privateKey: entry.key.privateKey!);
+                event: eventToAdd,
+                privateKey: entry.key.privateKey!,
+              );
             } else {
               eventToAddSigned = null;
             }
@@ -413,15 +480,19 @@ class MockRelay {
       // For now, ensuring signing is handled correctly if events are matched here.
       if (textNotes != null) {
         for (final entry in textNotes!.entries) {
-          bool authorsMatch = filter.authors != null &&
+          bool authorsMatch =
+              filter.authors != null &&
               filter.authors!.contains(entry.key.publicKey);
-          bool kindsMatch = filter.kinds == null ||
+          bool kindsMatch =
+              filter.kinds == null ||
               filter.kinds!.contains(entry.value.kind) ||
               (entry.value.kind == Nip01Event.kTextNodeKind &&
                   filter.kinds!.contains(Nip01Event.kTextNodeKind)) ||
-              (filter.kinds!.any((k) =>
-                  Nip51List.kPossibleKinds.contains(k) &&
-                  Nip51List.kPossibleKinds.contains(entry.value.kind)));
+              (filter.kinds!.any(
+                (k) =>
+                    Nip51List.kPossibleKinds.contains(k) &&
+                    Nip51List.kPossibleKinds.contains(entry.value.kind),
+              ));
           bool timeMatches = _matchesTimeFilter(entry.value, filter);
 
           if (authorsMatch && kindsMatch && timeMatches) {
@@ -430,7 +501,9 @@ class MockRelay {
             Nip01Event? eventToAddSigned;
             if (signEvents && entry.key.privateKey != null) {
               eventToAddSigned = Nip01Utils.signWithPrivateKey(
-                  event: eventToAdd, privateKey: entry.key.privateKey!);
+                event: eventToAdd,
+                privateKey: entry.key.privateKey!,
+              );
             } else {
               eventToAddSigned = null;
             }
@@ -457,8 +530,13 @@ class MockRelay {
     }
 
     for (final event in eventsToSend) {
-      webSocket.add(jsonEncode(
-          ["EVENT", requestId, Nip01EventModel.fromEntity(event).toJson()]));
+      webSocket.add(
+        jsonEncode([
+          "EVENT",
+          requestId,
+          Nip01EventModel.fromEntity(event).toJson(),
+        ]),
+      );
     }
 
     webSocket.add(jsonEncode(["EOSE", requestId]));
@@ -489,7 +567,9 @@ class MockRelay {
     Nip01Event? signedEvent;
     if (keyPair != null) {
       signedEvent = Nip01Utils.signWithPrivateKey(
-          event: event, privateKey: keyPair.privateKey!);
+        event: event,
+        privateKey: keyPair.privateKey!,
+      );
     }
 
     final eventToSend = signedEvent ?? event;
@@ -544,11 +624,13 @@ class MockRelay {
 
         for (var filter in filters) {
           if (_eventMatchesFilter(event, filter)) {
-            clientSocket.add(jsonEncode([
-              "EVENT",
-              subscriptionId,
-              Nip01EventModel.fromEntity(event).toJson()
-            ]));
+            clientSocket.add(
+              jsonEncode([
+                "EVENT",
+                subscriptionId,
+                Nip01EventModel.fromEntity(event).toJson(),
+              ]),
+            );
             break; // Only send once per subscription
           }
         }
@@ -629,7 +711,10 @@ class MockRelay {
       String decryptedContent;
       try {
         decryptedContent = await Nip44.decryptMessage(
-            event.content, _remoteSignerPrivateKey, event.pubKey);
+          event.content,
+          _remoteSignerPrivateKey,
+          event.pubKey,
+        );
       } catch (e) {
         log('MockRelay: Failed to decrypt NIP-46 request: $e');
         return;
@@ -655,7 +740,10 @@ class MockRelay {
       String encryptedResponse;
       try {
         encryptedResponse = await Nip44.encryptMessage(
-            responseContent, _remoteSignerPrivateKey, event.pubKey);
+          responseContent,
+          _remoteSignerPrivateKey,
+          event.pubKey,
+        );
       } catch (e) {
         log('MockRelay: Failed to encrypt NIP-46 response: $e');
         return;
@@ -672,7 +760,9 @@ class MockRelay {
         createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
       );
       Nip01Event responseEvent = Nip01Utils.signWithPrivateKey(
-          event: responseEventUnsinged, privateKey: _remoteSignerPrivateKey);
+        event: responseEventUnsinged,
+        privateKey: _remoteSignerPrivateKey,
+      );
 
       // NIP-46 events are ephemeral (kind 24133), broadcast to matching subscriptions
       _broadcastEventToSubscriptions(responseEvent);
@@ -683,7 +773,9 @@ class MockRelay {
 
   /// Process NIP-46 methods
   Future<Map<String, dynamic>> _processNip46Method(
-      String method, List<dynamic>? params) async {
+    String method,
+    List<dynamic>? params,
+  ) async {
     try {
       switch (method) {
         case 'connect':
@@ -693,14 +785,10 @@ class MockRelay {
             String? secret = params[0];
             log('MockRelay: NIP-46 connect with secret: ${secret != null}');
           }
-          return {
-            'result': 'ack',
-          };
+          return {'result': 'ack'};
 
         case 'ping':
-          return {
-            'result': 'pong',
-          };
+          return {'result': 'pong'};
 
         case 'get_relays':
           // Return the relay URL where this signer is available
@@ -712,14 +800,10 @@ class MockRelay {
 
         case 'disconnect':
           // Handle disconnection
-          return {
-            'result': 'ack',
-          };
+          return {'result': 'ack'};
 
         case 'get_public_key':
-          return {
-            'result': remoteSignerPublicKey,
-          };
+          return {'result': remoteSignerPublicKey};
 
         case 'sign_event':
           if (params == null || params.isEmpty) {
@@ -744,11 +828,13 @@ class MockRelay {
             content: signEventContentOverride ?? eventData["content"] ?? "",
             createdAt:
                 (eventData["created_at"] ?? eventData["createdAt"] ?? 0) +
-                    signEventCreatedAtOffsetSeconds,
+                signEventCreatedAtOffsetSeconds,
           );
 
           final Nip01Event signedEvent = Nip01Utils.signWithPrivateKey(
-              event: eventToSign, privateKey: _remoteSignerPrivateKey);
+            event: eventToSign,
+            privateKey: _remoteSignerPrivateKey,
+          );
 
           return {
             'result': Nip01EventModel.fromEntity(signedEvent).toJsonString(),
@@ -761,12 +847,13 @@ class MockRelay {
 
           String pubkey = params[0];
           String plaintext = params[1];
-          String encrypted =
-              Nip04.encrypt(_remoteSignerPrivateKey, pubkey, plaintext);
+          String encrypted = Nip04.encrypt(
+            _remoteSignerPrivateKey,
+            pubkey,
+            plaintext,
+          );
 
-          return {
-            'result': encrypted,
-          };
+          return {'result': encrypted};
 
         case 'nip04_decrypt':
           if (params == null || params.length < 2) {
@@ -775,12 +862,13 @@ class MockRelay {
 
           String pubkey = params[0];
           String ciphertext = params[1];
-          String decrypted =
-              Nip04.decrypt(_remoteSignerPrivateKey, pubkey, ciphertext);
+          String decrypted = Nip04.decrypt(
+            _remoteSignerPrivateKey,
+            pubkey,
+            ciphertext,
+          );
 
-          return {
-            'result': decrypted,
-          };
+          return {'result': decrypted};
 
         case 'nip44_encrypt':
           if (params == null || params.length < 2) {
@@ -790,11 +878,12 @@ class MockRelay {
           String pubkey = params[0];
           String plaintext = params[1];
           String encrypted = await Nip44.encryptMessage(
-              plaintext, _remoteSignerPrivateKey, pubkey);
+            plaintext,
+            _remoteSignerPrivateKey,
+            pubkey,
+          );
 
-          return {
-            'result': encrypted,
-          };
+          return {'result': encrypted};
 
         case 'nip44_decrypt':
           if (params == null || params.length < 2) {
@@ -804,21 +893,18 @@ class MockRelay {
           String pubkey = params[0];
           String ciphertext = params[1];
           String decrypted = await Nip44.decryptMessage(
-              ciphertext, _remoteSignerPrivateKey, pubkey);
+            ciphertext,
+            _remoteSignerPrivateKey,
+            pubkey,
+          );
 
-          return {
-            'result': decrypted,
-          };
+          return {'result': decrypted};
 
         default:
-          return {
-            'error': 'Unknown method: $method',
-          };
+          return {'error': 'Unknown method: $method'};
       }
     } catch (e) {
-      return {
-        'error': 'Error processing method $method: $e',
-      };
+      return {'error': 'Error processing method $method: $e'};
     }
   }
 }

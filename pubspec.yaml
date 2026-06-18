@@ -14,7 +14,7 @@ environment:
 
 dependencies:
   broadcast_queue_shim_for_ndk: ^0.2.1
-  ndk: ^0.8.4-dev.2
+  ndk: ^0.8.4-dev.5
   sembast: ^3.8.8+1
   uuid: ^4.5.3
   vcard_dart: ^2.1.0

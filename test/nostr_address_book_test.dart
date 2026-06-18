@@ -154,11 +154,11 @@ void main() {
       );
 
       expect(
-        await book.readRelays(),
+        await book.getReadRelays(),
         unorderedEquals(['wss://read.example', 'wss://both.example']),
       );
       expect(
-        await book.writeRelays(),
+        await book.getWriteRelays(),
         unorderedEquals(['wss://write.example', 'wss://both.example']),
       );
     });
