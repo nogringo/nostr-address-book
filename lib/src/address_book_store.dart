@@ -2,6 +2,14 @@ import 'package:sembast/sembast.dart';
 
 import 'nostr_address_book_models.dart';
 
+class DecryptedEventEntry {
+  /// Author of the encrypted event; `null` for entries written before 0.2.0.
+  final String? pubkey;
+  final String vCardText;
+
+  const DecryptedEventEntry({required this.pubkey, required this.vCardText});
+}
+
 class AddressBookStore {
   static const decryptedEventsName = 'address_book_decrypted_events';
   static const contactsName = 'address_book_contacts';
@@ -9,25 +17,61 @@ class AddressBookStore {
   static const uidEventsName = 'address_book_uid_events';
 
   final Database _database;
-  final StoreRef<String, String> _decryptedEvents;
+  final StoreRef<String, Object> _decryptedEvents;
   final StoreRef<String, Map<String, Object?>> _contacts;
   final StoreRef<String, Map<String, Object?>> _contactIndex;
   final StoreRef<String, Map<String, Object?>> _uidEvents;
 
   AddressBookStore(Database database)
     : _database = database,
-      _decryptedEvents = StoreRef<String, String>(decryptedEventsName),
+      _decryptedEvents = StoreRef<String, Object>(decryptedEventsName),
       _contacts = stringMapStoreFactory.store(contactsName),
       _contactIndex = stringMapStoreFactory.store(contactIndexName),
       _uidEvents = stringMapStoreFactory.store(uidEventsName);
 
-  Future<void> saveDecryptedEvent(String eventId, String decryptedText) {
-    return _decryptedEvents.record(eventId).put(_database, decryptedText);
+  /// Computed-store record key; the 64-char hex pubkey prefix keeps uids of
+  /// different accounts from colliding.
+  static String contactKey({required String pubkey, required String uid}) =>
+      '$pubkey:$uid';
+
+  Future<void> saveDecryptedEvent(
+    String eventId, {
+    required String pubkey,
+    required String vCardText,
+  }) {
+    return _decryptedEvents.record(eventId).put(_database, {
+      'pubkey': pubkey,
+      'vcard': vCardText,
+    });
   }
 
-  Future<Map<String, String>> loadAllDecryptedEvents() async {
+  Future<Map<String, DecryptedEventEntry>> loadAllDecryptedEvents() async {
     final records = await _decryptedEvents.find(_database);
-    return {for (final record in records) record.key: record.value};
+    final entries = <String, DecryptedEventEntry>{};
+    for (final record in records) {
+      final value = record.value;
+      if (value is String) {
+        // Pre-0.2.0 schema: bare decrypted text without author.
+        entries[record.key] = DecryptedEventEntry(
+          pubkey: null,
+          vCardText: value,
+        );
+      } else if (value is Map) {
+        final vCardText = value['vcard'];
+        if (vCardText is! String) continue;
+        entries[record.key] = DecryptedEventEntry(
+          pubkey: value['pubkey'] as String?,
+          vCardText: vCardText,
+        );
+      }
+    }
+    return entries;
+  }
+
+  Future<void> deleteDecryptedEvents(Iterable<String> eventIds) {
+    final ids = eventIds.toList(growable: false);
+    if (ids.isEmpty) return Future.value();
+    return _decryptedEvents.records(ids).delete(_database);
   }
 
   Future<void> clearComputed() {
@@ -38,31 +82,46 @@ class AddressBookStore {
     });
   }
 
+  Future<void> clearAll() {
+    return _database.transaction((txn) async {
+      await _decryptedEvents.delete(txn);
+      await _contacts.delete(txn);
+      await _contactIndex.delete(txn);
+      await _uidEvents.delete(txn);
+    });
+  }
+
   Future<void> saveComputed({
     required List<AddressBookContact> contacts,
-    required Map<String, List<String>> uidEvents,
+    required Map<({String pubkey, String uid}), List<String>> uidEvents,
   }) {
     return _database.transaction((txn) async {
       await _contacts.delete(txn);
       await _contactIndex.delete(txn);
       await _uidEvents.delete(txn);
       for (final contact in contacts) {
-        await _contacts.record(contact.uid).put(txn, contact.toJson());
-        await _contactIndex
-            .record(contact.uid)
-            .put(txn, contact.index.toJson());
+        final key = contactKey(pubkey: contact.pubKey, uid: contact.uid);
+        await _contacts.record(key).put(txn, contact.toJson());
+        await _contactIndex.record(key).put(txn, contact.index.toJson());
       }
       for (final entry in uidEvents.entries) {
-        await _uidEvents.record(entry.key).put(txn, {
-          'uid': entry.key,
+        final key = contactKey(pubkey: entry.key.pubkey, uid: entry.key.uid);
+        await _uidEvents.record(key).put(txn, {
+          'pubkey': entry.key.pubkey,
+          'uid': entry.key.uid,
           'eventIds': entry.value,
         });
       }
     });
   }
 
-  Future<AddressBookContact?> getContact(String uid) async {
-    final data = await _contacts.record(uid).get(_database);
+  Future<AddressBookContact?> getContact({
+    required String pubkey,
+    required String uid,
+  }) async {
+    final data = await _contacts
+        .record(contactKey(pubkey: pubkey, uid: uid))
+        .get(_database);
     if (data == null) return null;
     return AddressBookContact.fromJson(data);
   }
@@ -99,11 +158,17 @@ class AddressBookStore {
         );
   }
 
-  Stream<AddressBookContact?> watch(String uid) {
-    return _contacts.record(uid).onSnapshot(_database).map((snapshot) {
-      if (snapshot == null) return null;
-      return AddressBookContact.fromJson(snapshot.value);
-    });
+  Stream<AddressBookContact?> watch({
+    required String pubkey,
+    required String uid,
+  }) {
+    return _contacts
+        .record(contactKey(pubkey: pubkey, uid: uid))
+        .onSnapshot(_database)
+        .map((snapshot) {
+          if (snapshot == null) return null;
+          return AddressBookContact.fromJson(snapshot.value);
+        });
   }
 
   Iterable<AddressBookContact> _filter(
@@ -111,9 +176,11 @@ class AddressBookStore {
     ContactQuery? query,
   ) {
     final includeDeleted = query?.includeDeleted ?? false;
+    final pubkey = query?.pubkey;
     final text = query?.text?.trim().toLowerCase();
     return contacts.where((contact) {
       if (!includeDeleted && contact.deleted) return false;
+      if (pubkey != null && contact.pubKey != pubkey) return false;
       if (text == null || text.isEmpty) return true;
       final index = contact.index;
       final haystack = [

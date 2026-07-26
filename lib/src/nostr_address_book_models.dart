@@ -101,7 +101,11 @@ class ContactQuery {
   final String? text;
   final bool includeDeleted;
 
-  const ContactQuery({this.text, this.includeDeleted = false});
+  /// Restricts results to contacts owned by this account; `null` matches all
+  /// accounts in the database.
+  final String? pubkey;
+
+  const ContactQuery({this.text, this.includeDeleted = false, this.pubkey});
 }
 
 class AddressBookSyncResult {

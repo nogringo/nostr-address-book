@@ -22,17 +22,20 @@ class NostrAddressBook {
   /// NDK instance used for accounts, Nostr queries, broadcasts, and cache access.
   final Ndk ndk;
 
-  /// Sembast database used for address-book raw decrypted data, computed data,
-  /// and the offline broadcast queue.
+  /// Sembast database used for address-book raw decrypted data and computed
+  /// data.
   final Database database;
   final AddressBookStore _store;
 
   /// Offline-first broadcast queue used to eventually publish contact and
   /// deletion events.
   ///
-  /// Callers may use this directly for retry/status workflows, for example
-  /// [OfflineBroadcast.retryNow], [OfflineBroadcast.start], or
-  /// [OfflineBroadcast.watchPending].
+  /// The queue is caller-owned and may be shared with the rest of the app:
+  /// the package only enqueues address-book events, attributed to the signing
+  /// account, and never removes entries. Dropping an account's pending
+  /// broadcasts at logout is the caller's call, through
+  /// [OfflineBroadcast.clearLocalAccountData] or
+  /// [OfflineBroadcast.clearAllLocalData]; so is [OfflineBroadcast.dispose].
   final OfflineBroadcast broadcastQueue;
 
   /// Creates an address book backed by [ndk] and [database].
@@ -40,9 +43,14 @@ class NostrAddressBook {
   /// The constructor does not require a signer or relay list. Signing and
   /// NIP-44 self-encryption use the current account in `ndk.accounts`; relay
   /// selection is derived from NDK when events are queued for broadcast.
-  NostrAddressBook({required this.ndk, required this.database})
-    : _store = AddressBookStore(database),
-      broadcastQueue = OfflineBroadcast.withNdk(ndk, db: database);
+  ///
+  /// [broadcastQueue] is caller-owned; the same instance can be shared with
+  /// other packages broadcasting through the same database.
+  NostrAddressBook({
+    required this.ndk,
+    required this.database,
+    required this.broadcastQueue,
+  }) : _store = AddressBookStore(database);
 
   /// Fetches the newest address-book contact and deletion events.
   ///
@@ -143,29 +151,38 @@ class NostrAddressBook {
     );
 
     await ndk.config.cache.saveEvent(event);
-    await _store.saveDecryptedEvent(event.id, canonical.text);
+    await _store.saveDecryptedEvent(
+      event.id,
+      pubkey: account.pubkey,
+      vCardText: canonical.text,
+    );
     await rebuildComputedStores();
 
     final relays = await getWriteRelays();
     if (relays.isNotEmpty) {
-      await broadcastQueue.broadcast(event, relays: relays);
+      await broadcastQueue.broadcast(
+        event,
+        relays: relays,
+        pubkey: account.pubkey,
+      );
     }
 
-    final contact = await get(canonical.uid);
+    final contact = await get(canonical.uid, pubkey: account.pubkey);
     if (contact == null) {
       throw const NostrAddressBookException('Contact was not materialized');
     }
     return contact;
   }
 
-  /// Deletes the local contact with [uid] by queuing a NIP-09 deletion event.
+  /// Deletes the current account's contact with [uid] by queuing a NIP-09
+  /// deletion event.
   ///
   /// The deletion event targets the latest known contact event. The computed
   /// contact is marked deleted locally after the deletion event is saved to the
   /// NDK cache; relay delivery remains the responsibility of [broadcastQueue].
   Future<void> delete(String uid, {String reason = 'delete'}) async {
     final account = _requireSigningAccount();
-    final contact = await get(uid);
+    final contact = await get(uid, pubkey: account.pubkey);
     if (contact == null || contact.deleted) return;
 
     final now = Nip01Event.secondsSinceEpoch();
@@ -186,34 +203,48 @@ class NostrAddressBook {
 
     final relays = await getWriteRelays();
     if (relays.isNotEmpty) {
-      await broadcastQueue.broadcast(event, relays: relays);
+      await broadcastQueue.broadcast(
+        event,
+        relays: relays,
+        pubkey: account.pubkey,
+      );
     }
     await rebuildComputedStores();
   }
 
   /// Returns the local computed contact for [uid], or `null` if absent.
-  Future<AddressBookContact?> get(String uid) => _store.getContact(uid);
+  ///
+  /// [pubkey] selects the owning account; it defaults to the current account
+  /// and is then required to be logged in.
+  Future<AddressBookContact?> get(String uid, {String? pubkey}) {
+    return _store.getContact(pubkey: pubkey ?? _requirePubkey(), uid: uid);
+  }
 
   /// Lists local computed contacts.
   ///
-  /// This reads only Sembast computed stores and does not require internet or a
-  /// signer.
+  /// This reads only Sembast computed stores and does not require internet or
+  /// a signer. Without [ContactQuery.pubkey] the result spans every account
+  /// stored in the database.
   Future<List<AddressBookContact>> list({ContactQuery? query}) {
     return _store.list(query: query);
   }
 
   /// Watches local computed contacts.
   ///
-  /// This is a Sembast watcher, not an NDK network subscription.
+  /// This is a Sembast watcher, not an NDK network subscription. Without
+  /// [ContactQuery.pubkey] the stream spans every account stored in the
+  /// database.
   Stream<List<AddressBookContact>> watchAll({ContactQuery? query}) {
     return _store.watchAll(query: query);
   }
 
   /// Watches a single local computed contact by [uid].
   ///
-  /// This is a Sembast watcher, not an NDK network subscription.
-  Stream<AddressBookContact?> watch(String uid) {
-    return _store.watch(uid);
+  /// This is a Sembast watcher, not an NDK network subscription. [pubkey]
+  /// selects the owning account; it defaults to the current account and is
+  /// then required to be logged in.
+  Stream<AddressBookContact?> watch(String uid, {String? pubkey}) {
+    return _store.watch(pubkey: pubkey ?? _requirePubkey(), uid: uid);
   }
 
   /// Drops and rebuilds all computed address-book stores.
@@ -221,11 +252,17 @@ class NostrAddressBook {
   /// Rebuild uses only the NDK cache and the raw
   /// `address_book_decrypted_events` store, so it works without internet and
   /// without a signer. Raw decrypted entries whose encrypted NDK event is no
-  /// longer present are ignored.
+  /// longer present are ignored. Contacts are keyed per account, so identical
+  /// uids owned by different accounts do not collide, and NIP-09 deletions
+  /// only apply to contacts of their own author.
+  ///
+  /// Raw entries written before 0.2.0 carry no author; when their encrypted
+  /// event is still cached they are rewritten with its pubkey so
+  /// [clearLocalAccountData] can attribute them.
   Future<int> rebuildComputedStores() async {
     final decryptedEvents = await _store.loadAllDecryptedEvents();
     final candidates = <_ContactCandidate>[];
-    final uidEvents = <String, List<String>>{};
+    final uidEvents = <({String pubkey, String uid}), List<String>>{};
 
     for (final entry in decryptedEvents.entries) {
       final event = await ndk.config.cache.loadEvent(entry.key);
@@ -233,10 +270,19 @@ class NostrAddressBook {
       final uid = event.getDtag();
       if (uid == null || uid.isEmpty) continue;
       try {
-        final canonical = VCardTools.parseExisting(entry.value);
+        final canonical = VCardTools.parseExisting(entry.value.vCardText);
         if (canonical.uid != uid) continue;
+        if (entry.value.pubkey == null) {
+          await _store.saveDecryptedEvent(
+            event.id,
+            pubkey: event.pubKey,
+            vCardText: canonical.text,
+          );
+        }
         candidates.add(_ContactCandidate(event: event, card: canonical));
-        uidEvents.putIfAbsent(uid, () => []).add(event.id);
+        uidEvents
+            .putIfAbsent((pubkey: event.pubKey, uid: uid), () => [])
+            .add(event.id);
       } on NostrAddressBookException {
         continue;
       }
@@ -245,29 +291,28 @@ class NostrAddressBook {
     final deletions = await _loadDeletionTimes(
       knownEventIds: candidates.map((candidate) => candidate.event.id).toSet(),
     );
-    final byUid = <String, _ContactCandidate>{};
+    final byContact = <({String pubkey, String uid}), _ContactCandidate>{};
     for (final candidate in candidates) {
-      final uid = candidate.card.uid;
-      final current = byUid[uid];
+      final key = (pubkey: candidate.event.pubKey, uid: candidate.card.uid);
+      final current = byContact[key];
       if (current == null || _isNewer(candidate.event, current.event)) {
-        byUid[uid] = candidate;
+        byContact[key] = candidate;
       }
     }
 
     final contacts = <AddressBookContact>[];
-    for (final entry in byUid.entries) {
-      final uid = entry.key;
+    for (final entry in byContact.entries) {
       final candidate = entry.value;
-      final deletionTime = deletions[uid] ?? 0;
+      final deletionTime = deletions[entry.key] ?? 0;
       final deleted = deletionTime > candidate.event.createdAt;
       contacts.add(
         AddressBookContact(
-          uid: uid,
+          uid: entry.key.uid,
           vCard: candidate.card.text,
           index: candidate.card.index,
           eventId: candidate.event.id,
           eventCreatedAt: candidate.event.createdAt,
-          pubKey: candidate.event.pubKey,
+          pubKey: entry.key.pubkey,
           status: deleted
               ? AddressBookContactStatus.deleted
               : AddressBookContactStatus.active,
@@ -288,11 +333,19 @@ class NostrAddressBook {
   }
 
   /// Builds the contact filter used by fetch/pull operations.
-  Filter contactFilter({String? uid, int? limit, int? since, int? until}) {
-    final pubkey = _requirePubkey();
+  ///
+  /// [pubkey] overrides the author and defaults to the current account.
+  Filter contactFilter({
+    String? uid,
+    int? limit,
+    int? since,
+    int? until,
+    String? pubkey,
+  }) {
+    final author = pubkey ?? _requirePubkey();
     return Filter(
       kinds: [contactKind],
-      authors: [pubkey],
+      authors: [author],
       dTags: uid == null ? null : [uid],
       limit: uid != null ? (limit ?? 1) : limit,
       since: since,
@@ -301,11 +354,13 @@ class NostrAddressBook {
   }
 
   /// Builds the NIP-09 deletion filter used by fetch/pull operations.
-  Filter deletionFilter({int? limit, int? since, int? until}) {
-    final pubkey = _requirePubkey();
+  ///
+  /// [pubkey] overrides the author and defaults to the current account.
+  Filter deletionFilter({int? limit, int? since, int? until, String? pubkey}) {
+    final author = pubkey ?? _requirePubkey();
     return Filter(
       kinds: [deletionKind],
-      authors: [pubkey],
+      authors: [author],
       tags: {
         '#k': [contactKind.toString()],
       },
@@ -315,8 +370,98 @@ class NostrAddressBook {
     );
   }
 
-  /// Disposes the package-owned broadcast queue resources.
-  Future<void> dispose() => broadcastQueue.dispose();
+  /// Removes the local address-book data of one account.
+  ///
+  /// This removes, for [pubkey] only:
+  ///
+  /// - raw decrypted vCard entries authored by that account;
+  /// - kind [contactKind] events authored by that account in the NDK cache;
+  /// - NIP-09 deletion events authored by that account targeting
+  ///   [contactKind];
+  /// - NDK fetched-range records of that account's contact and deletion
+  ///   filters, so a later pull re-downloads everything.
+  ///
+  /// Computed stores are rebuilt afterwards, so contacts of other accounts
+  /// sharing the same database survive. Pre-0.2.0 raw entries whose encrypted
+  /// event is no longer cached cannot be attributed and are kept;
+  /// [clearAllLocalData] removes those.
+  ///
+  /// The caller-owned [broadcastQueue] is not touched: also call
+  /// [OfflineBroadcast.clearLocalAccountData] on it, otherwise the account's
+  /// pending events are eventually published.
+  ///
+  /// No logged account is required, so this can run after logout. Relays are
+  /// not contacted: events already published remain on relays and are fetched
+  /// again on the next sync for that account.
+  Future<void> clearLocalAccountData({required String pubkey}) async {
+    final decryptedEvents = await _store.loadAllDecryptedEvents();
+    final ownedEventIds = <String>[];
+    for (final entry in decryptedEvents.entries) {
+      if (entry.value.pubkey == pubkey) {
+        ownedEventIds.add(entry.key);
+      } else if (entry.value.pubkey == null) {
+        final event = await ndk.config.cache.loadEvent(entry.key);
+        if (event != null && event.pubKey == pubkey) {
+          ownedEventIds.add(entry.key);
+        }
+      }
+    }
+    await _store.deleteDecryptedEvents(ownedEventIds);
+
+    final deletionEvents = await ndk.config.cache.loadEvents(
+      kinds: [deletionKind],
+      pubKeys: [pubkey],
+    );
+    final deletionIds = deletionEvents
+        .where(_deletesAddressBookKind)
+        .map((event) => event.id)
+        .toList(growable: false);
+    if (deletionIds.isNotEmpty) {
+      await ndk.config.cache.removeEvents(ids: deletionIds);
+    }
+    await ndk.config.cache.removeEvents(
+      pubKeys: [pubkey],
+      kinds: [contactKind],
+    );
+
+    await ndk.fetchedRanges.clearForFilter(contactFilter(pubkey: pubkey));
+    await ndk.fetchedRanges.clearForFilter(deletionFilter(pubkey: pubkey));
+
+    await rebuildComputedStores();
+  }
+
+  /// Removes all local address-book data, every account included.
+  ///
+  /// This empties the raw and computed Sembast stores and removes kind
+  /// [contactKind] events and address-book NIP-09 deletions from the NDK
+  /// cache. NDK fetched-range records are cleared globally, because past
+  /// per-account filter hashes cannot be enumerated; other NDK consumers
+  /// simply re-download once.
+  ///
+  /// The caller-owned [broadcastQueue] is not touched: also call
+  /// [OfflineBroadcast.clearLocalAccountData] or
+  /// [OfflineBroadcast.clearAllLocalData] on it, otherwise pending events are
+  /// eventually published.
+  ///
+  /// No logged account is required. Relays are not contacted: events already
+  /// published remain on relays.
+  Future<void> clearAllLocalData() async {
+    final deletionEvents = await ndk.config.cache.loadEvents(
+      kinds: [deletionKind],
+    );
+    final deletionIds = deletionEvents
+        .where(_deletesAddressBookKind)
+        .map((event) => event.id)
+        .toList(growable: false);
+    if (deletionIds.isNotEmpty) {
+      await ndk.config.cache.removeEvents(ids: deletionIds);
+    }
+    await ndk.config.cache.removeEvents(kinds: [contactKind]);
+
+    await ndk.fetchedRanges.clearAll();
+
+    await _store.clearAll();
+  }
 
   Future<AddressBookSyncResult> _fetch({
     required Filter contactFilter,
@@ -362,7 +507,11 @@ class NostrAddressBook {
           skipped++;
           continue;
         }
-        await _store.saveDecryptedEvent(event.id, canonical.text);
+        await _store.saveDecryptedEvent(
+          event.id,
+          pubkey: event.pubKey,
+          vCardText: canonical.text,
+        );
         decrypted++;
       } on NostrAddressBookException {
         skipped++;
@@ -402,7 +551,6 @@ class NostrAddressBook {
 
     final since = filter.since ?? 0;
     final until = filter.until ?? Nip01Event.secondsSinceEpoch();
-    // ignore: experimental_member_use
     final optimized = await ndk.fetchedRanges.getOptimizedFilters(
       filter: filter,
       since: since,
@@ -438,32 +586,37 @@ class NostrAddressBook {
     return byId.values.toList(growable: false);
   }
 
-  Future<Map<String, int>> _loadDeletionTimes({
+  Future<Map<({String pubkey, String uid}), int>> _loadDeletionTimes({
     required Set<String> knownEventIds,
   }) async {
     final deletionEvents = await ndk.config.cache.loadEvents(
       kinds: [deletionKind],
     );
-    final byUid = <String, int>{};
+    final byContact = <({String pubkey, String uid}), int>{};
 
     for (final deletion in deletionEvents) {
       if (!_deletesAddressBookKind(deletion)) continue;
-      final uidFromATags = deletion.getTags('a').map(_uidFromAddressTag);
-      for (final uid in uidFromATags.whereType<String>()) {
-        byUid[uid] = _max(byUid[uid], deletion.createdAt);
+      for (final tag in deletion.getTags('a')) {
+        final uid = _uidFromAddressTag(tag, author: deletion.pubKey);
+        if (uid == null) continue;
+        final key = (pubkey: deletion.pubKey, uid: uid);
+        byContact[key] = _max(byContact[key], deletion.createdAt);
       }
 
       for (final eventId in deletion.getTags('e')) {
         if (!knownEventIds.contains(eventId)) continue;
         final deletedEvent = await ndk.config.cache.loadEvent(eventId);
         if (deletedEvent == null || deletedEvent.kind != contactKind) continue;
+        // NIP-09: only the author may delete their own events.
+        if (deletedEvent.pubKey != deletion.pubKey) continue;
         final uid = deletedEvent.getDtag();
         if (uid == null || uid.isEmpty) continue;
-        byUid[uid] = _max(byUid[uid], deletion.createdAt);
+        final key = (pubkey: deletion.pubKey, uid: uid);
+        byContact[key] = _max(byContact[key], deletion.createdAt);
       }
     }
 
-    return byUid;
+    return byContact;
   }
 
   bool _deletesAddressBookKind(Nip01Event deletion) {
@@ -476,10 +629,12 @@ class NostrAddressBook {
     return kTags.contains(contactKind.toString());
   }
 
-  String? _uidFromAddressTag(String tag) {
+  String? _uidFromAddressTag(String tag, {required String author}) {
     final parts = tag.split(':');
     if (parts.length < 3) return null;
     if (parts.first != contactKind.toString()) return null;
+    // NIP-09: only the author may delete their own addressable events.
+    if (parts[1] != author) return null;
     return parts.sublist(2).join(':');
   }
 

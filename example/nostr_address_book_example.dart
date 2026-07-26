@@ -1,3 +1,4 @@
+import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart';
 import 'package:nostr_address_book/nostr_address_book.dart';
 import 'package:sembast/sembast_memory.dart';
@@ -16,7 +17,12 @@ Future<void> main() async {
   final (privateKey, publicKey) = signerFactory.generateKeyPair();
   ndk.accounts.loginPrivateKey(pubkey: publicKey, privkey: privateKey);
 
-  final book = NostrAddressBook(ndk: ndk, database: database);
+  final broadcastQueue = OfflineBroadcast.withNdk(ndk, db: database);
+  final book = NostrAddressBook(
+    ndk: ndk,
+    database: database,
+    broadcastQueue: broadcastQueue,
+  );
 
   final contact = await book.upsertVCard('''
 BEGIN:VCARD
@@ -42,7 +48,12 @@ END:VCARD
   await book.rebuildComputedStores();
   print('Rebuilt computed stores without signer');
 
-  await book.dispose();
+  // The queue is caller-owned: clear it alongside the address-book data.
+  await broadcastQueue.clearLocalAccountData(pubkey: publicKey);
+  await book.clearLocalAccountData(pubkey: publicKey);
+  print('Cleared local data for $publicKey');
+
+  await broadcastQueue.dispose();
   await ndk.destroy();
   await database.close();
 }

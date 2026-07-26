@@ -1,3 +1,4 @@
+import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart';
 import 'package:ndk/entities.dart' as ndk_entities;
 import 'package:nostr_address_book/nostr_address_book.dart';
@@ -12,6 +13,7 @@ void main() {
     late Database db;
     late Ndk ndk;
     late Bip340EventSigner signer;
+    late OfflineBroadcast queue;
     late NostrAddressBook book;
 
     setUp(() async {
@@ -27,11 +29,12 @@ void main() {
         ),
       );
       ndk.accounts.loginExternalSigner(signer: signer);
-      book = NostrAddressBook(ndk: ndk, database: db);
+      queue = OfflineBroadcast.withNdk(ndk, db: db);
+      book = NostrAddressBook(ndk: ndk, database: db, broadcastQueue: queue);
     });
 
     tearDown(() async {
-      await book.dispose();
+      await queue.dispose();
       await ndk.destroy();
       await db.close();
     });
@@ -43,10 +46,12 @@ void main() {
 
         final contact = await book.upsertVCard(input);
 
-        final raw = await StoreRef<String, String>(
-          'address_book_decrypted_events',
-        ).record(contact.eventId).get(db);
-        expect(raw, input);
+        final raw = await stringMapStoreFactory
+            .store('address_book_decrypted_events')
+            .record(contact.eventId)
+            .get(db);
+        expect(raw?['vcard'], input);
+        expect(raw?['pubkey'], signer.getPublicKey());
 
         ndk.accounts.logout();
         final rebuiltCount = await book.rebuildComputedStores();
@@ -163,6 +168,228 @@ void main() {
       );
     });
 
+    test('same uid across accounts stays separate, deletions stay per '
+        'account', () async {
+      const uid = 'urn:uuid:shared';
+      final signerB = _newSigner();
+      final cardA = await _encryptedContactEvent(
+        signer: signer,
+        uid: uid,
+        name: 'From A',
+        createdAt: 100,
+      );
+      final cardB = await _encryptedContactEvent(
+        signer: signerB,
+        uid: uid,
+        name: 'From B',
+        createdAt: 200,
+      );
+      final deletionByA = Nip01Event(
+        pubKey: signer.getPublicKey(),
+        kind: NostrAddressBook.deletionKind,
+        tags: [
+          [
+            'a',
+            '${NostrAddressBook.contactKind}:${signer.getPublicKey()}:$uid',
+          ],
+          ['k', NostrAddressBook.contactKind.toString()],
+        ],
+        content: 'delete',
+        createdAt: 150,
+      );
+
+      await ndk.config.cache.saveEvents([
+        cardA.event,
+        cardB.event,
+        deletionByA,
+      ]);
+      await _seedRaw(db, cardA, signer.getPublicKey());
+      await _seedRaw(db, cardB, signerB.getPublicKey());
+
+      await book.rebuildComputedStores();
+
+      final all = await book.list(
+        query: const ContactQuery(includeDeleted: true),
+      );
+      expect(all, hasLength(2));
+
+      final contactA = await book.get(uid, pubkey: signer.getPublicKey());
+      final contactB = await book.get(uid, pubkey: signerB.getPublicKey());
+      expect(contactA!.deleted, isTrue);
+      expect(contactB!.deleted, isFalse);
+      expect(contactB.index.formattedName, 'From B');
+
+      final onlyB = await book.list(
+        query: ContactQuery(pubkey: signerB.getPublicKey()),
+      );
+      expect(onlyB.single.pubKey, signerB.getPublicKey());
+    });
+
+    test('clearLocalAccountData removes one account only', () async {
+      final relay = MockRelay(name: 'clear account relay');
+      await relay.startServer();
+      try {
+        final signerB = _newSigner();
+        for (final pubkey in [signer.getPublicKey(), signerB.getPublicKey()]) {
+          await ndk.config.cache.saveUserRelayList(
+            ndk_entities.UserRelayList(
+              pubKey: pubkey,
+              relays: {relay.url: ndk_entities.ReadWriteMarker.readWrite},
+              createdAt: 100,
+              refreshedTimestamp: 100,
+            ),
+          );
+        }
+
+        await book.upsertVCard(
+          _vcard(uid: 'urn:uuid:owned-a', name: 'Owned A'),
+        );
+        await book.delete('urn:uuid:owned-a');
+        ndk.accounts.logout();
+        ndk.accounts.loginExternalSigner(signer: signerB);
+        final contactB = await book.upsertVCard(
+          _vcard(uid: 'urn:uuid:owned-b', name: 'Owned B'),
+        );
+
+        await book.clearLocalAccountData(pubkey: signer.getPublicKey());
+
+        final remaining = await book.list(
+          query: const ContactQuery(includeDeleted: true),
+        );
+        expect(remaining.single.uid, 'urn:uuid:owned-b');
+        expect(
+          await book.get('urn:uuid:owned-a', pubkey: signer.getPublicKey()),
+          isNull,
+        );
+
+        expect(
+          await ndk.config.cache.loadEvents(
+            kinds: [NostrAddressBook.contactKind],
+            pubKeys: [signer.getPublicKey()],
+          ),
+          isEmpty,
+        );
+        expect(
+          await ndk.config.cache.loadEvents(
+            kinds: [NostrAddressBook.deletionKind],
+            pubKeys: [signer.getPublicKey()],
+          ),
+          isEmpty,
+        );
+        expect(
+          await ndk.config.cache.loadEvents(
+            kinds: [NostrAddressBook.contactKind],
+            pubKeys: [signerB.getPublicKey()],
+          ),
+          hasLength(1),
+        );
+
+        // The caller-owned queue is untouched by the package clear, and every
+        // entry of A (contact + deletion) is attributed to it.
+        final entriesOfA = (await queue.listAll()).where(
+          (entry) => entry.pubkey == signer.getPublicKey(),
+        );
+        expect(entriesOfA, hasLength(2));
+
+        await queue.clearLocalAccountData(pubkey: signer.getPublicKey());
+
+        expect(
+          (await queue.listAll()).where(
+            (entry) => entry.pubkey == signer.getPublicKey(),
+          ),
+          isEmpty,
+        );
+        expect(
+          await queue.get(contactB.eventId, pubkey: signerB.getPublicKey()),
+          isNotNull,
+        );
+      } finally {
+        await relay.stopServer();
+      }
+    });
+
+    test('clearAllLocalData wipes stores and cache, not the queue', () async {
+      final relay = MockRelay(name: 'clear all relay');
+      await relay.startServer();
+      try {
+        await ndk.config.cache.saveUserRelayList(
+          ndk_entities.UserRelayList(
+            pubKey: signer.getPublicKey(),
+            relays: {relay.url: ndk_entities.ReadWriteMarker.readWrite},
+            createdAt: 100,
+            refreshedTimestamp: 100,
+          ),
+        );
+        await book.upsertVCard(_vcard(uid: 'urn:uuid:wipe-me', name: 'Wipe'));
+        await book.delete('urn:uuid:wipe-me');
+
+        await book.clearAllLocalData();
+
+        expect(
+          await book.list(query: const ContactQuery(includeDeleted: true)),
+          isEmpty,
+        );
+        expect(await book.rebuildComputedStores(), 0);
+
+        // The caller-owned queue is untouched by the package clear.
+        expect(await queue.listAll(), isNotEmpty);
+        await queue.clearAllLocalData();
+        expect(await queue.listAll(), isEmpty);
+        expect(
+          await ndk.config.cache.loadEvents(
+            kinds: [NostrAddressBook.contactKind],
+          ),
+          isEmpty,
+        );
+        expect(
+          await stringMapStoreFactory
+              .store('address_book_decrypted_events')
+              .find(db),
+          isEmpty,
+        );
+      } finally {
+        await relay.stopServer();
+      }
+    });
+
+    test(
+      'pre-0.2.0 raw entries are attributed on rebuild and cleared',
+      () async {
+        final card = await _encryptedContactEvent(
+          signer: signer,
+          uid: 'urn:uuid:legacy',
+          name: 'Legacy',
+          createdAt: 100,
+        );
+        await ndk.config.cache.saveEvent(card.event);
+        await StoreRef<String, String>(
+          'address_book_decrypted_events',
+        ).record(card.event.id).put(db, card.decrypted);
+
+        await book.rebuildComputedStores();
+
+        final healed = await stringMapStoreFactory
+            .store('address_book_decrypted_events')
+            .record(card.event.id)
+            .get(db);
+        expect(healed?['pubkey'], signer.getPublicKey());
+
+        await book.clearLocalAccountData(pubkey: signer.getPublicKey());
+
+        expect(
+          await book.get('urn:uuid:legacy', pubkey: signer.getPublicKey()),
+          isNull,
+        );
+        expect(
+          await stringMapStoreFactory
+              .store('address_book_decrypted_events')
+              .record(card.event.id)
+              .get(db),
+          isNull,
+        );
+      },
+    );
+
     test('upsert and delete queue signed events for broadcast', () async {
       final relay = MockRelay(name: 'signed queue relay');
       await relay.startServer();
@@ -180,7 +407,10 @@ void main() {
         final contact = await book.upsertVCard(
           _vcard(uid: uid, name: 'Signed Queue'),
         );
-        final queued = await book.broadcastQueue.get(contact.eventId);
+        final queued = await book.broadcastQueue.get(
+          contact.eventId,
+          pubkey: signer.getPublicKey(),
+        );
 
         expect(queued, isNotNull);
         expect(queued!.event.sig, isNotNull);
@@ -205,10 +435,11 @@ void main() {
     late Bip340EventSigner signer;
     late MockRelay relay;
     late Ndk ndk;
+    late OfflineBroadcast queue;
     late NostrAddressBook book;
 
     tearDown(() async {
-      await book.dispose();
+      await queue.dispose();
       await ndk.destroy();
       await relay.stopServer();
       await db.close();
@@ -235,7 +466,8 @@ void main() {
         ),
       ]);
       await ndk.config.cache.clearAll();
-      book = NostrAddressBook(ndk: ndk, database: db);
+      queue = OfflineBroadcast.withNdk(ndk, db: db);
+      book = NostrAddressBook(ndk: ndk, database: db, broadcastQueue: queue);
 
       final filters = book.recentFilters();
       final result = await book.fetchRecent();
@@ -267,7 +499,8 @@ void main() {
         events.map((event) => _EncryptedContact(event: event, decrypted: '')),
       );
       await ndk.config.cache.clearAll();
-      book = NostrAddressBook(ndk: ndk, database: db);
+      queue = OfflineBroadcast.withNdk(ndk, db: db);
+      book = NostrAddressBook(ndk: ndk, database: db, broadcastQueue: queue);
 
       final result = await book.pull(paginate: true);
 
@@ -275,6 +508,13 @@ void main() {
       expect(await book.list(), hasLength(3));
     });
   });
+}
+
+Future<void> _seedRaw(Database db, _EncryptedContact contact, String pubkey) {
+  return stringMapStoreFactory
+      .store('address_book_decrypted_events')
+      .record(contact.event.id)
+      .put(db, {'pubkey': pubkey, 'vcard': contact.decrypted});
 }
 
 Bip340EventSigner _newSigner() {
