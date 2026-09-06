@@ -1,3 +1,9 @@
+## 0.3.0
+
+- Breaking: require `ndk: ^0.9.2` and `broadcast_queue_shim_for_ndk: ^0.5.0`.
+  Both the `Ndk` instance and the broadcast queue are caller-owned, so the app
+  has to move to ndk `0.9` as well.
+
 ## 0.2.0
 
 - Add `clearLocalAccountData({required String pubkey})` and

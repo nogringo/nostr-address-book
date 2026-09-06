@@ -145,18 +145,11 @@ void main() {
     });
 
     test('read and write relays are resolved from NIP-65 markers', () async {
-      await ndk.config.cache.saveUserRelayList(
-        ndk_entities.UserRelayList(
-          pubKey: signer.getPublicKey(),
-          relays: {
-            'wss://read.example': ndk_entities.ReadWriteMarker.readOnly,
-            'wss://write.example': ndk_entities.ReadWriteMarker.writeOnly,
-            'wss://both.example': ndk_entities.ReadWriteMarker.readWrite,
-          },
-          createdAt: 100,
-          refreshedTimestamp: 100,
-        ),
-      );
+      await _seedRelayList(ndk, signer.getPublicKey(), {
+        'wss://read.example': ndk_entities.ReadWriteMarker.readOnly,
+        'wss://write.example': ndk_entities.ReadWriteMarker.writeOnly,
+        'wss://both.example': ndk_entities.ReadWriteMarker.readWrite,
+      });
 
       expect(
         await book.getReadRelays(),
@@ -231,14 +224,9 @@ void main() {
       try {
         final signerB = _newSigner();
         for (final pubkey in [signer.getPublicKey(), signerB.getPublicKey()]) {
-          await ndk.config.cache.saveUserRelayList(
-            ndk_entities.UserRelayList(
-              pubKey: pubkey,
-              relays: {relay.url: ndk_entities.ReadWriteMarker.readWrite},
-              createdAt: 100,
-              refreshedTimestamp: 100,
-            ),
-          );
+          await _seedRelayList(ndk, pubkey, {
+            relay.url: ndk_entities.ReadWriteMarker.readWrite,
+          });
         }
 
         await book.upsertVCard(
@@ -312,14 +300,9 @@ void main() {
       final relay = MockRelay(name: 'clear all relay');
       await relay.startServer();
       try {
-        await ndk.config.cache.saveUserRelayList(
-          ndk_entities.UserRelayList(
-            pubKey: signer.getPublicKey(),
-            relays: {relay.url: ndk_entities.ReadWriteMarker.readWrite},
-            createdAt: 100,
-            refreshedTimestamp: 100,
-          ),
-        );
+        await _seedRelayList(ndk, signer.getPublicKey(), {
+          relay.url: ndk_entities.ReadWriteMarker.readWrite,
+        });
         await book.upsertVCard(_vcard(uid: 'urn:uuid:wipe-me', name: 'Wipe'));
         await book.delete('urn:uuid:wipe-me');
 
@@ -395,14 +378,9 @@ void main() {
       await relay.startServer();
       try {
         const uid = 'urn:uuid:signed-queue';
-        await ndk.config.cache.saveUserRelayList(
-          ndk_entities.UserRelayList(
-            pubKey: signer.getPublicKey(),
-            relays: {relay.url: ndk_entities.ReadWriteMarker.writeOnly},
-            createdAt: 100,
-            refreshedTimestamp: 100,
-          ),
-        );
+        await _seedRelayList(ndk, signer.getPublicKey(), {
+          relay.url: ndk_entities.ReadWriteMarker.writeOnly,
+        });
 
         final contact = await book.upsertVCard(
           _vcard(uid: uid, name: 'Signed Queue'),
@@ -508,6 +486,23 @@ void main() {
       expect(await book.list(), hasLength(3));
     });
   });
+}
+
+/// NDK derives the cached user relay list from kind 10002 events, so a bare
+/// `saveUserRelayList` is dropped as soon as any other event of that author is
+/// cached (ndk >= 0.8.4-dev.11).
+Future<void> _seedRelayList(
+  Ndk ndk,
+  String pubkey,
+  Map<String, ndk_entities.ReadWriteMarker> relays,
+) {
+  return ndk.config.cache.saveEvent(
+    ndk_entities.Nip65(
+      pubKey: pubkey,
+      relays: relays,
+      createdAt: 100,
+    ).toEvent(),
+  );
 }
 
 Future<void> _seedRaw(Database db, _EncryptedContact contact, String pubkey) {
