@@ -157,6 +157,135 @@ void main() {
       expect(contact.index.formattedName, 'Restored Name');
     });
 
+    test('delete queues an empty version addressed by a tag only', () async {
+      final relay = MockRelay(name: 'tombstone relay');
+      await relay.startServer();
+      try {
+        const uid = 'urn:uuid:tombstone';
+        await _seedRelayList(ndk, signer.getPublicKey(), {
+          relay.url: ndk_entities.ReadWriteMarker.writeOnly,
+        });
+        await book.upsertVCard(_vcard(uid: uid, name: 'To Delete'));
+
+        await book.delete(uid);
+
+        final queued = (await queue.listAll())
+            .map((entry) => entry.event)
+            .toList();
+        final tombstone = queued
+            .where(
+              (event) =>
+                  event.kind == NostrAddressBook.contactKind &&
+                  event.content.isEmpty,
+            )
+            .single;
+        final deletion = queued
+            .where((event) => event.kind == NostrAddressBook.deletionKind)
+            .single;
+
+        expect(tombstone.getDtag(), uid);
+        expect(tombstone.sig, isNotEmpty);
+        expect(tombstone.createdAt, deletion.createdAt);
+        expect(deletion.getTags('e'), isEmpty);
+        expect(deletion.getTags('a'), [
+          '${NostrAddressBook.contactKind}:${signer.getPublicKey()}:$uid',
+        ]);
+        expect(deletion.getTags('k'), [
+          NostrAddressBook.contactKind.toString(),
+        ]);
+        expect((await book.get(uid))!.deleted, isTrue);
+      } finally {
+        await relay.stopServer();
+      }
+    });
+
+    test('an e tag deletion only removes the version it names', () async {
+      const uid = 'urn:uuid:by-id';
+      final stale = await _encryptedContactEvent(
+        signer: signer,
+        uid: uid,
+        name: 'Stale Version',
+        createdAt: 100,
+      );
+      final current = await _encryptedContactEvent(
+        signer: signer,
+        uid: uid,
+        name: 'Current Version',
+        createdAt: 200,
+      );
+      final deletion = Nip01Event(
+        pubKey: signer.getPublicKey(),
+        kind: NostrAddressBook.deletionKind,
+        tags: [
+          ['e', stale.event.id],
+          ['k', NostrAddressBook.contactKind.toString()],
+        ],
+        content: 'delete',
+        createdAt: 300,
+      );
+
+      await ndk.config.cache.saveEvents([stale.event, current.event, deletion]);
+      await _seedRaw(db, stale, signer.getPublicKey());
+      await _seedRaw(db, current, signer.getPublicKey());
+
+      await book.rebuildComputedStores();
+
+      final contact = await book.get(uid);
+      expect(contact!.deleted, isFalse);
+      expect(contact.index.formattedName, 'Current Version');
+    });
+
+    test('a deletion sharing the contact second still applies', () async {
+      const uid = 'urn:uuid:same-second';
+      final card = await _encryptedContactEvent(
+        signer: signer,
+        uid: uid,
+        name: 'Same Second',
+        createdAt: 100,
+      );
+      final deletion = Nip01Event(
+        pubKey: signer.getPublicKey(),
+        kind: NostrAddressBook.deletionKind,
+        tags: [
+          [
+            'a',
+            '${NostrAddressBook.contactKind}:${signer.getPublicKey()}:$uid',
+          ],
+          ['k', NostrAddressBook.contactKind.toString()],
+        ],
+        content: 'delete',
+        createdAt: 100,
+      );
+
+      await ndk.config.cache.saveEvents([card.event, deletion]);
+      await _seedRaw(db, card, signer.getPublicKey());
+
+      await book.rebuildComputedStores();
+
+      expect((await book.get(uid))!.deleted, isTrue);
+    });
+
+    test('reconcile ignores an empty version without marking it '
+        'unusable', () async {
+      const uid = 'urn:uuid:remote-tombstone';
+      final tombstone = Nip01Event(
+        pubKey: signer.getPublicKey(),
+        kind: NostrAddressBook.contactKind,
+        tags: [
+          ['d', uid],
+        ],
+        content: '',
+        createdAt: 200,
+      );
+      await ndk.config.cache.saveEvent(tombstone);
+
+      final result = await book.reconcile();
+
+      expect(result.decryptedEvents, 0);
+      expect(result.skippedEvents, 0);
+      expect(await book.get(uid), isNull);
+    });
+
     test('reconcile decrypts cached events that landed on their own', () async {
       const uid = 'urn:uuid:reconciled';
       final card = await _encryptedContactEvent(
@@ -305,11 +434,11 @@ void main() {
         );
 
         // The caller-owned queue is untouched by the package clear, and every
-        // entry of A (contact + deletion) is attributed to it.
+        // entry of A (contact + tombstone + deletion) is attributed to it.
         final entriesOfA = (await queue.listAll()).where(
           (entry) => entry.pubkey == signer.getPublicKey(),
         );
-        expect(entriesOfA, hasLength(2));
+        expect(entriesOfA, hasLength(3));
 
         await queue.clearLocalAccountData(pubkey: signer.getPublicKey());
 

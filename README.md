@@ -7,7 +7,12 @@ Contacts are stored as vCard 4.0 payloads in addressable Nostr events:
 - kind `38522`
 - `d` tag equal to the vCard `UID`
 - NIP-44 self-encrypted content by default
-- NIP-09 deletion events for removals
+- NIP-09 deletion events for removals, addressed by `a` tag
+
+A removal queues two events under one `created_at`: an empty version of the
+contact event, then the deletion request. Relays honouring NIP-09 drop both.
+Relays ignoring it are left serving the empty version rather than the encrypted
+vCard.
 
 ## Usage
 

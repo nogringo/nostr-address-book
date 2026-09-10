@@ -247,24 +247,44 @@ class NostrAddressBook {
     return contact;
   }
 
-  /// Deletes the current account's contact with [uid] by queuing a NIP-09
-  /// deletion event.
+  /// Deletes the current account's contact with [uid] by queuing an empty
+  /// version of the contact event followed by a NIP-09 deletion event.
   ///
-  /// The deletion event targets the latest known contact event. The computed
-  /// contact is marked deleted locally after the deletion event is saved to the
-  /// NDK cache; relay delivery remains the responsibility of [broadcastQueue].
+  /// The deletion event addresses the contact through its `a` tag only. For an
+  /// addressable kind that tag already covers every version up to the deletion
+  /// timestamp, whereas an `e` tag would name a single version that may be
+  /// stale by the time it is written.
+  ///
+  /// The empty version carries the same `created_at` as the deletion event, so
+  /// a relay honouring NIP-09 drops both and keeps nothing. A relay ignoring
+  /// NIP-09 still replaces the contact with the empty version and stops serving
+  /// the encrypted vCard.
+  ///
+  /// The computed contact is marked deleted locally after both events are saved
+  /// to the NDK cache; relay delivery remains the responsibility of
+  /// [broadcastQueue].
   Future<void> delete(String uid, {String reason = 'delete'}) async {
     final account = _requireSigningAccount();
     final contact = await get(uid, pubkey: account.pubkey);
     if (contact == null || contact.deleted) return;
 
     final now = Nip01Event.secondsSinceEpoch();
+    final tombstone = await account.signer.sign(
+      Nip01Event(
+        pubKey: account.pubkey,
+        kind: contactKind,
+        tags: [
+          ['d', uid],
+        ],
+        content: '',
+        createdAt: now,
+      ),
+    );
     final event = await account.signer.sign(
       Nip01Event(
         pubKey: account.pubkey,
         kind: deletionKind,
         tags: [
-          ['e', contact.eventId],
           ['a', '$contactKind:${account.pubkey}:$uid'],
           ['k', contactKind.toString()],
         ],
@@ -272,15 +292,17 @@ class NostrAddressBook {
         createdAt: now,
       ),
     );
-    await ndk.config.cache.saveEvent(event);
+    await ndk.config.cache.saveEvents([tombstone, event]);
 
     final relays = await getWriteRelays();
     if (relays.isNotEmpty) {
-      await broadcastQueue.broadcast(
-        event,
-        relays: relays,
-        pubkey: account.pubkey,
-      );
+      for (final pending in [tombstone, event]) {
+        await broadcastQueue.broadcast(
+          pending,
+          relays: relays,
+          pubkey: account.pubkey,
+        );
+      }
     }
     await rebuildComputedStores();
   }
@@ -361,7 +383,7 @@ class NostrAddressBook {
       }
     }
 
-    final deletions = await _loadDeletionTimes(
+    final deletions = await _loadDeletions(
       knownEventIds: candidates.map((candidate) => candidate.event.id).toSet(),
     );
     final byContact = <({String pubkey, String uid}), _ContactCandidate>{};
@@ -376,8 +398,11 @@ class NostrAddressBook {
     final contacts = <AddressBookContact>[];
     for (final entry in byContact.entries) {
       final candidate = entry.value;
-      final deletionTime = deletions[entry.key] ?? 0;
-      final deleted = deletionTime > candidate.event.createdAt;
+      final deletionTime = deletions.times[entry.key];
+      // NIP-09: an `a` tag covers versions up to its own timestamp, included.
+      final deleted =
+          deletions.eventIds.contains(candidate.event.id) ||
+          (deletionTime != null && deletionTime >= candidate.event.createdAt);
       contacts.add(
         AddressBookContact(
           uid: entry.key.uid,
@@ -548,6 +573,8 @@ class NostrAddressBook {
       if (known.containsKey(event.id) || _unusableEvents.contains(event.id)) {
         continue;
       }
+      // An empty version is the tombstone left by [delete], not a payload.
+      if (event.content.isEmpty) continue;
       final text = await account.signer.decryptNip44(
         ciphertext: event.content,
         senderPubKey: event.pubKey,
@@ -593,13 +620,22 @@ class NostrAddressBook {
     ]);
   }
 
-  Future<Map<({String pubkey, String uid}), int>> _loadDeletionTimes({
+  /// Reads the NIP-09 deletions that apply to address-book contacts.
+  ///
+  /// The two tag forms carry different semantics and are kept apart. An `a` tag
+  /// deletes every version of the address up to its `created_at`, so it yields
+  /// a timestamp per contact. An `e` tag deletes one event, whatever its date,
+  /// so it yields a set of event ids. This package only writes `a` tags; the
+  /// `e` set covers deletions written by other clients and by its own earlier
+  /// versions.
+  Future<_Deletions> _loadDeletions({
     required Set<String> knownEventIds,
   }) async {
     final deletionEvents = await ndk.config.cache.loadEvents(
       kinds: [deletionKind],
     );
-    final byContact = <({String pubkey, String uid}), int>{};
+    final times = <({String pubkey, String uid}), int>{};
+    final ids = <String>{};
 
     for (final deletion in deletionEvents) {
       if (!_deletesAddressBookKind(deletion)) continue;
@@ -607,7 +643,7 @@ class NostrAddressBook {
         final uid = _uidFromAddressTag(tag, author: deletion.pubKey);
         if (uid == null) continue;
         final key = (pubkey: deletion.pubKey, uid: uid);
-        byContact[key] = _max(byContact[key], deletion.createdAt);
+        times[key] = _max(times[key], deletion.createdAt);
       }
 
       for (final eventId in deletion.getTags('e')) {
@@ -616,14 +652,11 @@ class NostrAddressBook {
         if (deletedEvent == null || deletedEvent.kind != contactKind) continue;
         // NIP-09: only the author may delete their own events.
         if (deletedEvent.pubKey != deletion.pubKey) continue;
-        final uid = deletedEvent.getDtag();
-        if (uid == null || uid.isEmpty) continue;
-        final key = (pubkey: deletion.pubKey, uid: uid);
-        byContact[key] = _max(byContact[key], deletion.createdAt);
+        ids.add(eventId);
       }
     }
 
-    return byContact;
+    return _Deletions(times: times, eventIds: ids);
   }
 
   bool _deletesAddressBookKind(Nip01Event deletion) {
@@ -689,6 +722,16 @@ class NostrAddressBook {
     if (current == null || next > current) return next;
     return current;
   }
+}
+
+class _Deletions {
+  /// Latest `a` tag deletion timestamp per contact.
+  final Map<({String pubkey, String uid}), int> times;
+
+  /// Contact event ids named by an `e` tag.
+  final Set<String> eventIds;
+
+  const _Deletions({required this.times, required this.eventIds});
 }
 
 class _ContactCandidate {

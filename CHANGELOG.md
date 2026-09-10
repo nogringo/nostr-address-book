@@ -1,5 +1,17 @@
 ## 0.4.0
 
+- `delete` publishes an empty version of the contact event alongside the NIP-09
+  deletion request, both stamped with the same `created_at`. A relay honouring
+  NIP-09 drops the two and keeps nothing; a relay ignoring it still replaces the
+  contact with the empty version and stops serving the encrypted vCard.
+- The deletion request no longer carries an `e` tag. For an addressable kind the
+  `a` tag already covers every version up to the deletion timestamp, while an
+  `e` tag names a single version that may be stale by the time it is written.
+- Deletions read from relays keep the two tag forms apart, as NIP-09 defines
+  them: an `e` tag deletes the one event it names, an `a` tag every version up
+  to its own `created_at`, that timestamp included. A contact and its deletion
+  sharing one second are now resolved as deleted, and deleting a superseded
+  version by id no longer takes the current one down with it.
 - Breaking: downward sync moves to `sync_engine_shim_for_ndk`. The constructor
   requires a caller-owned `syncEngine`, shareable with the rest of the app like
   the broadcast queue. The engine works out what is missing, fetches it into
