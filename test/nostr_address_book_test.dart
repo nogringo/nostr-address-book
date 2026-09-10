@@ -3,6 +3,7 @@ import 'package:ndk/ndk.dart';
 import 'package:ndk/entities.dart' as ndk_entities;
 import 'package:nostr_address_book/nostr_address_book.dart';
 import 'package:sembast/sembast_memory.dart';
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 import 'package:test/test.dart';
 
 import 'support/mock_relay.dart';
@@ -14,6 +15,7 @@ void main() {
     late Ndk ndk;
     late Bip340EventSigner signer;
     late OfflineBroadcast queue;
+    late SyncEngine engine;
     late NostrAddressBook book;
 
     setUp(() async {
@@ -29,12 +31,23 @@ void main() {
         ),
       );
       ndk.accounts.loginExternalSigner(signer: signer);
-      queue = OfflineBroadcast.withNdk(ndk, db: db);
-      book = NostrAddressBook(ndk: ndk, database: db, broadcastQueue: queue);
+      queue = OfflineBroadcast.withNdk(
+        ndk,
+        db: db,
+        perAttemptTimeout: const Duration(seconds: 1),
+      );
+      engine = SyncEngine(ndk, db: db)..start();
+      book = NostrAddressBook(
+        ndk: ndk,
+        database: db,
+        broadcastQueue: queue,
+        syncEngine: engine,
+      );
     });
 
     tearDown(() async {
       await queue.dispose();
+      await engine.dispose();
       await ndk.destroy();
       await db.close();
     });
@@ -142,6 +155,25 @@ void main() {
       final contact = await book.get(uid);
       expect(contact!.deleted, isFalse);
       expect(contact.index.formattedName, 'Restored Name');
+    });
+
+    test('reconcile decrypts cached events that landed on their own', () async {
+      const uid = 'urn:uuid:reconciled';
+      final card = await _encryptedContactEvent(
+        signer: signer,
+        uid: uid,
+        name: 'Landed Alone',
+        createdAt: 100,
+      );
+      await ndk.config.cache.saveEvent(card.event);
+
+      final result = await book.reconcile();
+
+      expect(result.decryptedEvents, 1);
+      expect((await book.get(uid))!.index.formattedName, 'Landed Alone');
+
+      // A second pass has nothing left to decrypt.
+      expect((await book.reconcile()).decryptedEvents, 0);
     });
 
     test('read and write relays are resolved from NIP-65 markers', () async {
@@ -414,62 +446,31 @@ void main() {
     late MockRelay relay;
     late Ndk ndk;
     late OfflineBroadcast queue;
+    late SyncEngine engine;
     late NostrAddressBook book;
 
     tearDown(() async {
       await queue.dispose();
+      await engine.dispose();
       await ndk.destroy();
       await relay.stopServer();
       await db.close();
     });
 
-    test('fetchRecent uses limit 500 without paginate', () async {
-      db = await databaseFactoryMemory.openDatabase('fetch_recent.db');
-      signer = _newSigner();
-      relay = MockRelay(name: 'fetch recent relay', maxEventsPerRequest: 1);
-      await relay.startServer();
-      ndk = _ndkForRelay(relay.url, signer);
-      await _publishContactEvents(ndk, [
-        await _encryptedContactEvent(
-          signer: signer,
-          uid: 'urn:uuid:recent-1',
-          name: 'Recent One',
-          createdAt: 100,
-        ),
-        await _encryptedContactEvent(
-          signer: signer,
-          uid: 'urn:uuid:recent-2',
-          name: 'Recent Two',
-          createdAt: 101,
-        ),
-      ]);
-      await ndk.config.cache.clearAll();
-      queue = OfflineBroadcast.withNdk(ndk, db: db);
-      book = NostrAddressBook(ndk: ndk, database: db, broadcastQueue: queue);
-
-      final filters = book.recentFilters();
-      final result = await book.fetchRecent();
-
-      expect(filters.contacts.limit, NostrAddressBook.recentLimit);
-      expect(filters.deletions.limit, NostrAddressBook.recentLimit);
-      expect(result.decryptedEvents, 1);
-      expect(await book.list(), hasLength(1));
-    });
-
-    test('pull paginates contact filters', () async {
-      db = await databaseFactoryMemory.openDatabase('pull_paginate.db');
+    test('refresh syncs contacts and materializes them', () async {
+      db = await databaseFactoryMemory.openDatabase('refresh_sync.db');
       signer = _newSigner();
       final events = <Nip01Event>[];
       for (var i = 0; i < 3; i++) {
-        final event = await _encryptedContactEvent(
+        final contact = await _encryptedContactEvent(
           signer: signer,
-          uid: 'urn:uuid:page-$i',
-          name: 'Page $i',
-          createdAt: 100 + i,
+          uid: 'urn:uuid:sync-$i',
+          name: 'Sync $i',
+          createdAt: Nip01Event.secondsSinceEpoch() - i,
         );
-        events.add(event.event);
+        events.add(contact.event);
       }
-      relay = MockRelay(name: 'pull paginate relay', maxEventsPerRequest: 1);
+      relay = MockRelay(name: 'refresh sync relay');
       await relay.startServer();
       ndk = _ndkForRelay(relay.url, signer);
       await _publishContactEvents(
@@ -477,13 +478,68 @@ void main() {
         events.map((event) => _EncryptedContact(event: event, decrypted: '')),
       );
       await ndk.config.cache.clearAll();
-      queue = OfflineBroadcast.withNdk(ndk, db: db);
-      book = NostrAddressBook(ndk: ndk, database: db, broadcastQueue: queue);
+      queue = OfflineBroadcast.withNdk(
+        ndk,
+        db: db,
+        perAttemptTimeout: const Duration(seconds: 1),
+      );
+      engine = SyncEngine(ndk, db: db)..start();
+      book = NostrAddressBook(
+        ndk: ndk,
+        database: db,
+        broadcastQueue: queue,
+        syncEngine: engine,
+      );
 
-      final result = await book.pull(paginate: true);
+      final result = await book.refresh();
 
       expect(result.decryptedEvents, 3);
       expect(await book.list(), hasLength(3));
+    });
+
+    test('sync keeps one handle, clearing forgets its coverage', () async {
+      db = await databaseFactoryMemory.openDatabase('sync_handle.db');
+      signer = _newSigner();
+      relay = MockRelay(name: 'sync handle relay');
+      await relay.startServer();
+      ndk = _ndkForRelay(relay.url, signer);
+      queue = OfflineBroadcast.withNdk(
+        ndk,
+        db: db,
+        perAttemptTimeout: const Duration(seconds: 1),
+      );
+      engine = SyncEngine(ndk, db: db)..start();
+      book = NostrAddressBook(
+        ndk: ndk,
+        database: db,
+        broadcastQueue: queue,
+        syncEngine: engine,
+      );
+
+      final handle = await book.sync();
+      expect(await book.sync(), handle);
+      // Racing declarations must not register the request twice.
+      expect((await Future.wait([book.sync(), book.sync()])).toSet(), {handle});
+
+      await book.refresh();
+      final filter = book.contactFilter();
+      expect(
+        await engine.coverageOfFilter(
+          filter,
+          authPubkey: signer.getPublicKey(),
+        ),
+        isNotEmpty,
+      );
+
+      await book.clearLocalAccountData(pubkey: signer.getPublicKey());
+
+      expect(
+        await engine.coverageOfFilter(
+          filter,
+          authPubkey: signer.getPublicKey(),
+        ),
+        isEmpty,
+      );
     });
   });
 }

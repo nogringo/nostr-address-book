@@ -1,9 +1,9 @@
-import 'dart:async';
-
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart';
 import 'package:sembast/sembast.dart' show Database;
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
+import 'address_book_sync.dart';
 import 'address_book_store.dart';
 import 'nostr_address_book_exception.dart';
 import 'nostr_address_book_models.dart';
@@ -15,9 +15,6 @@ class NostrAddressBook {
 
   /// NIP-09 deletion event kind.
   static const int deletionKind = 5;
-
-  /// Default number of newest contact/deletion events fetched by [fetchRecent].
-  static const int recentLimit = 500;
 
   /// NDK instance used for accounts, Nostr queries, broadcasts, and cache access.
   final Ndk ndk;
@@ -38,42 +35,128 @@ class NostrAddressBook {
   /// [OfflineBroadcast.clearAllLocalData]; so is [OfflineBroadcast.dispose].
   final OfflineBroadcast broadcastQueue;
 
+  /// Downward sync engine keeping the NDK cache in step with the relays.
+  ///
+  /// The engine is caller-owned and may be shared with the rest of the app:
+  /// the package declares its own address-book requests through [sync] and
+  /// only ever forgets those. Disposing the engine, or clearing everything it
+  /// persisted, is the caller's call.
+  final SyncEngine syncEngine;
+
+  late final AddressBookSync _sync;
+
+  /// Cached contact events that failed to decrypt or parse, so a landed page
+  /// does not retry them. In memory only: a restart tries again.
+  final Set<String> _unusableEvents = {};
+
   /// Creates an address book backed by [ndk] and [database].
   ///
   /// The constructor does not require a signer or relay list. Signing and
   /// NIP-44 self-encryption use the current account in `ndk.accounts`; relay
   /// selection is derived from NDK when events are queued for broadcast.
   ///
-  /// [broadcastQueue] is caller-owned; the same instance can be shared with
-  /// other packages broadcasting through the same database.
+  /// [broadcastQueue] and [syncEngine] are caller-owned; the same instances
+  /// can be shared with other packages working through the same database.
   NostrAddressBook({
     required this.ndk,
     required this.database,
     required this.broadcastQueue,
-  }) : _store = AddressBookStore(database);
+    required this.syncEngine,
+  }) : _store = AddressBookStore(database) {
+    _sync = AddressBookSync(
+      engine: syncEngine,
+      requestOf: (pubkey) => syncRequest(pubkey: pubkey),
+      reconcileOf: (pubkey) async {
+        final account = ndk.accounts.accounts[pubkey];
+        if (account == null || !account.signer.canSign()) return null;
+        return _reconcile(account);
+      },
+    );
+  }
 
-  /// Fetches the newest address-book contact and deletion events.
+  /// Declares the address-book sync of one account and keeps it up to date.
   ///
-  /// This is intended as a quick startup refresh. It queries contacts and
-  /// NIP-09 deletions with [recentLimit] and does not paginate. Queries are
-  /// sent explicitly to [getReadRelays].
-  Future<AddressBookSyncResult> fetchRecent() {
-    return _fetch(
-      contactFilter: contactFilter(limit: recentLimit),
-      deletionFilter: deletionFilter(limit: recentLimit),
-      paginate: false,
+  /// The engine fetches the missing contact and deletion events into the NDK
+  /// cache, then revisits their recent end on its own, so the caller has no
+  /// polling to write. Every page that lands is reconciled: newly cached
+  /// events are decrypted and the computed stores are rebuilt.
+  ///
+  /// Calling this again is cheap and returns the same handle, unless
+  /// [getReadRelays] no longer matches the relays the request was declared on:
+  /// the previous handle is then released and a new one takes its place.
+  ///
+  /// The request authenticates as [pubkey], which defaults to the current
+  /// account. That account must be in `ndk.accounts` and able to sign, or the
+  /// engine reads nothing and reports a `SyncAuthUnavailable`.
+  ///
+  /// Reconciliation decrypts only for the currently logged account, so a
+  /// request declared for another account materializes its contacts when that
+  /// account is back and [reconcile] runs.
+  Future<SyncHandle> sync({String? pubkey}) {
+    return _sync.declare(pubkey ?? _requirePubkey());
+  }
+
+  /// Fetches now, however fresh the coverage is, then reconciles.
+  ///
+  /// This is the pull to refresh gesture. It declares the sync of the current
+  /// account if [sync] has not run yet, and returns what every reconciliation
+  /// pass made of the events that landed while it ran, background passes on
+  /// the pages of this very refresh included.
+  Future<AddressBookSyncResult> refresh() {
+    return _sync.refresh(_requireSigningAccount().pubkey);
+  }
+
+  /// Turns the cached contact events of the current account into contacts.
+  ///
+  /// Every kind [contactKind] event of that account in the NDK cache that has
+  /// no decrypted entry yet is decrypted, stored, and the computed stores are
+  /// rebuilt. This is what [sync] runs on each landed page; call it directly
+  /// after events reached the cache through another path.
+  Future<AddressBookSyncResult> reconcile() {
+    return _sync.reconcile(_requireSigningAccount().pubkey);
+  }
+
+  /// Drops this package's interest in the sync of one account.
+  ///
+  /// What was synced stays in the cache and the coverage stays recorded, so a
+  /// later [sync] resumes rather than walking everything back. [pubkey]
+  /// defaults to the current account.
+  void stopSync({String? pubkey}) => _sync.release(pubkey ?? _requirePubkey());
+
+  /// Drops this package's interest in every account's sync.
+  ///
+  /// No logged account is required, so this can run at logout or shutdown.
+  void stopAllSync() => _sync.releaseAll();
+
+  /// Builds the sync request of one account, as [sync] declares it.
+  ///
+  /// Exposed so the caller can watch its status through
+  /// `syncEngine.watchStatus`, or hand it to `syncEngine.forget`. [pubkey]
+  /// defaults to the current account.
+  Future<SyncRequest> syncRequest({String? pubkey}) async {
+    final target = pubkey ?? _requirePubkey();
+    return SyncRequest(
+      filters: [
+        contactFilter(pubkey: target),
+        deletionFilter(pubkey: target),
+      ],
+      relays: await getReadRelays(pubkey: target),
+      authPubkey: target,
     );
   }
 
   /// Returns the relay URLs used for reading address-book events.
   ///
-  /// The list comes from the current account NIP-65 read relays through
-  /// `ndk.userRelayLists`. If no read relay is available, the method falls
-  /// back explicitly to currently connected relays, then NDK bootstrap relays.
-  Future<List<String>> getReadRelays({bool forceRefresh = false}) async {
-    final pubkey = _requirePubkey();
+  /// The list comes from the NIP-65 read relays of [pubkey], which defaults to
+  /// the current account, through `ndk.userRelayLists`. If no read relay is
+  /// available, the method falls back explicitly to currently connected
+  /// relays, then NDK bootstrap relays.
+  Future<List<String>> getReadRelays({
+    String? pubkey,
+    bool forceRefresh = false,
+  }) async {
     final userRelayList = await ndk.userRelayLists.getSingleUserRelayList(
-      pubkey,
+      pubkey ?? _requirePubkey(),
       forceRefresh: forceRefresh,
     );
     return _relayFallback(userRelayList?.readUrls ?? const []);
@@ -81,29 +164,19 @@ class NostrAddressBook {
 
   /// Returns the relay URLs used for publishing address-book events.
   ///
-  /// The list comes from the current account NIP-65 write relays through
-  /// `ndk.userRelayLists`. If no write relay is available, the method falls
-  /// back explicitly to currently connected relays, then NDK bootstrap relays.
-  Future<List<String>> getWriteRelays({bool forceRefresh = false}) async {
-    final pubkey = _requirePubkey();
+  /// The list comes from the NIP-65 write relays of [pubkey], which defaults
+  /// to the current account, through `ndk.userRelayLists`. If no write relay
+  /// is available, the method falls back explicitly to currently connected
+  /// relays, then NDK bootstrap relays.
+  Future<List<String>> getWriteRelays({
+    String? pubkey,
+    bool forceRefresh = false,
+  }) async {
     final userRelayList = await ndk.userRelayLists.getSingleUserRelayList(
-      pubkey,
+      pubkey ?? _requirePubkey(),
       forceRefresh: forceRefresh,
     );
     return _relayFallback(userRelayList?.writeUrls ?? const []);
-  }
-
-  Future<AddressBookSyncResult> pull({
-    bool paginate = true,
-    int? since,
-    int? until,
-  }) {
-    return _fetch(
-      contactFilter: contactFilter(since: since, until: until),
-      deletionFilter: deletionFilter(since: since, until: until),
-      paginate: paginate,
-      useFetchedRanges: since != null || until != null,
-    );
   }
 
   /// Saves or updates a contact from a vCard 4.0 text payload.
@@ -324,47 +397,31 @@ class NostrAddressBook {
     return contacts.length;
   }
 
-  /// Returns the filters used by [fetchRecent].
-  AddressBookFilters recentFilters() {
-    return AddressBookFilters(
-      contacts: contactFilter(limit: recentLimit),
-      deletions: deletionFilter(limit: recentLimit),
-    );
-  }
-
-  /// Builds the contact filter used by fetch/pull operations.
+  /// Builds the contact filter of a sync request.
   ///
   /// [pubkey] overrides the author and defaults to the current account.
-  Filter contactFilter({
-    String? uid,
-    int? limit,
-    int? since,
-    int? until,
-    String? pubkey,
-  }) {
-    final author = pubkey ?? _requirePubkey();
+  /// [since] and [until] bound the window; without them the engine walks back
+  /// to the oldest contact event the relays hold. A `limit` would be ignored
+  /// by the engine, so the filter carries none.
+  Filter contactFilter({String? pubkey, int? since, int? until}) {
     return Filter(
       kinds: [contactKind],
-      authors: [author],
-      dTags: uid == null ? null : [uid],
-      limit: uid != null ? (limit ?? 1) : limit,
+      authors: [pubkey ?? _requirePubkey()],
       since: since,
       until: until,
     );
   }
 
-  /// Builds the NIP-09 deletion filter used by fetch/pull operations.
+  /// Builds the NIP-09 deletion filter of a sync request.
   ///
   /// [pubkey] overrides the author and defaults to the current account.
-  Filter deletionFilter({int? limit, int? since, int? until, String? pubkey}) {
-    final author = pubkey ?? _requirePubkey();
+  Filter deletionFilter({String? pubkey, int? since, int? until}) {
     return Filter(
       kinds: [deletionKind],
-      authors: [author],
+      authors: [pubkey ?? _requirePubkey()],
       tags: {
         '#k': [contactKind.toString()],
       },
-      limit: limit,
       since: since,
       until: until,
     );
@@ -378,8 +435,10 @@ class NostrAddressBook {
   /// - kind [contactKind] events authored by that account in the NDK cache;
   /// - NIP-09 deletion events authored by that account targeting
   ///   [contactKind];
-  /// - NDK fetched-range records of that account's contact and deletion
-  ///   filters, so a later pull re-downloads everything.
+  /// - the sync coverage of that account's requests, on every relay they were
+  ///   was synced from, so a later [sync] walks them back from scratch.
+  ///
+  /// The account's sync is released; other accounts keep syncing.
   ///
   /// Computed stores are rebuilt afterwards, so contacts of other accounts
   /// sharing the same database survive. Pre-0.2.0 raw entries whose encrypted
@@ -424,19 +483,18 @@ class NostrAddressBook {
       kinds: [contactKind],
     );
 
-    await ndk.fetchedRanges.clearForFilter(contactFilter(pubkey: pubkey));
-    await ndk.fetchedRanges.clearForFilter(deletionFilter(pubkey: pubkey));
+    await _forgetSync(pubkey);
+    _unusableEvents.clear();
 
     await rebuildComputedStores();
   }
 
   /// Removes all local address-book data, every account included.
   ///
-  /// This empties the raw and computed Sembast stores and removes kind
+  /// This empties the raw and computed Sembast stores, removes kind
   /// [contactKind] events and address-book NIP-09 deletions from the NDK
-  /// cache. NDK fetched-range records are cleared globally, because past
-  /// per-account filter hashes cannot be enumerated; other NDK consumers
-  /// simply re-download once.
+  /// cache, and forgets the sync coverage of every address-book request ever
+  /// declared. Requests of other packages sharing the engine are untouched.
   ///
   /// The caller-owned [broadcastQueue] is not touched: also call
   /// [OfflineBroadcast.clearLocalAccountData] or
@@ -446,6 +504,16 @@ class NostrAddressBook {
   /// No logged account is required. Relays are not contacted: events already
   /// published remain on relays.
   Future<void> clearAllLocalData() async {
+    final contactEvents = await ndk.config.cache.loadEvents(
+      kinds: [contactKind],
+    );
+    final decryptedEvents = await _store.loadAllDecryptedEvents();
+    final accounts = {
+      ..._sync.declaredAccounts,
+      ...contactEvents.map((event) => event.pubKey),
+      ...decryptedEvents.values.map((entry) => entry.pubkey).nonNulls,
+    };
+
     final deletionEvents = await ndk.config.cache.loadEvents(
       kinds: [deletionKind],
     );
@@ -458,39 +526,26 @@ class NostrAddressBook {
     }
     await ndk.config.cache.removeEvents(kinds: [contactKind]);
 
-    await ndk.fetchedRanges.clearAll();
+    for (final pubkey in accounts) {
+      await _forgetSync(pubkey);
+    }
+    stopAllSync();
+    _unusableEvents.clear();
 
     await _store.clearAll();
   }
 
-  Future<AddressBookSyncResult> _fetch({
-    required Filter contactFilter,
-    required Filter deletionFilter,
-    required bool paginate,
-    bool useFetchedRanges = false,
-  }) async {
-    final account = _requireAccount();
-    final relays = await getReadRelays();
-    final contactEvents = await _queryContacts(
-      contactFilter,
-      relays: relays,
-      paginate: paginate,
-      useFetchedRanges: useFetchedRanges,
+  Future<AddressBookSyncResult> _reconcile(Account account) async {
+    final cached = await ndk.config.cache.loadEvents(
+      kinds: [contactKind],
+      pubKeys: [account.pubkey],
     );
-    final deletionEvents = await ndk.requests
-        .query(
-          filter: deletionFilter,
-          explicitRelays: relays,
-          desiredCoverage: relays.isEmpty ? null : 1,
-          paginate: paginate,
-        )
-        .future;
+    final known = await _store.loadAllDecryptedEvents();
 
     var decrypted = 0;
     var skipped = 0;
-    for (final event in contactEvents) {
-      if (event.pubKey != account.pubkey || event.kind != contactKind) {
-        skipped++;
+    for (final event in cached) {
+      if (known.containsKey(event.id) || _unusableEvents.contains(event.id)) {
         continue;
       }
       final text = await account.signer.decryptNip44(
@@ -498,12 +553,14 @@ class NostrAddressBook {
         senderPubKey: event.pubKey,
       );
       if (text == null) {
+        _unusableEvents.add(event.id);
         skipped++;
         continue;
       }
       try {
         final canonical = VCardTools.parseExisting(text);
         if (canonical.uid != event.getDtag()) {
+          _unusableEvents.add(event.id);
           skipped++;
           continue;
         }
@@ -514,76 +571,26 @@ class NostrAddressBook {
         );
         decrypted++;
       } on NostrAddressBookException {
+        _unusableEvents.add(event.id);
         skipped++;
       }
     }
 
     final computed = await rebuildComputedStores();
     return AddressBookSyncResult(
-      fetchedEvents: contactEvents.length + deletionEvents.length,
       decryptedEvents: decrypted,
       skippedEvents: skipped,
       computedContacts: computed,
     );
   }
 
-  Future<List<Nip01Event>> _queryContacts(
-    Filter filter, {
-    required List<String> relays,
-    required bool paginate,
-    required bool useFetchedRanges,
-  }) async {
-    if (!useFetchedRanges || filter.since == null && filter.until == null) {
-      return ndk.requests
-          .query(
-            filter: filter,
-            explicitRelays: relays,
-            desiredCoverage: relays.isEmpty ? null : 1,
-            paginate: paginate,
-          )
-          .future;
-    }
-
-    final relayUrls = relays;
-    if (relayUrls.isEmpty) {
-      return const [];
-    }
-
-    final since = filter.since ?? 0;
-    final until = filter.until ?? Nip01Event.secondsSinceEpoch();
-    final optimized = await ndk.fetchedRanges.getOptimizedFilters(
-      filter: filter,
-      since: since,
-      until: until,
-      relayUrls: relayUrls,
-    );
-    if (optimized.isEmpty) return const [];
-
-    final responses = await Future.wait(
-      optimized.entries.map((entry) async {
-        final events = <Nip01Event>[];
-        for (final optimizedFilter in entry.value) {
-          final result = await ndk.requests
-              .query(
-                filter: optimizedFilter,
-                explicitRelays: [entry.key],
-                desiredCoverage: 1,
-                paginate: paginate,
-              )
-              .future;
-          events.addAll(result);
-        }
-        return events;
-      }),
-    );
-
-    final byId = <String, Nip01Event>{};
-    for (final events in responses) {
-      for (final event in events) {
-        byId[event.id] = event;
-      }
-    }
-    return byId.values.toList(growable: false);
+  /// Forgets the coverage of [pubkey]'s filters, on every relay they were
+  /// synced from, and releases its request.
+  Future<void> _forgetSync(String pubkey) {
+    return _sync.forget(pubkey, [
+      contactFilter(pubkey: pubkey),
+      deletionFilter(pubkey: pubkey),
+    ]);
   }
 
   Future<Map<({String pubkey, String uid}), int>> _loadDeletionTimes({

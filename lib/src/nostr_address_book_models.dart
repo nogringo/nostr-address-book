@@ -1,5 +1,3 @@
-import 'package:ndk/ndk.dart';
-
 enum AddressBookContactStatus { active, deleted }
 
 class ContactIndex {
@@ -108,25 +106,22 @@ class ContactQuery {
   const ContactQuery({this.text, this.includeDeleted = false, this.pubkey});
 }
 
+/// Outcome of a reconciliation between the NDK cache and the local stores.
 class AddressBookSyncResult {
-  final int fetchedEvents;
+  /// Cached contact events decrypted and stored by this pass.
   final int decryptedEvents;
+
+  /// Cached contact events this pass could not use, because decryption failed
+  /// or the payload was not a matching vCard.
   final int skippedEvents;
+
   final int computedContacts;
 
   const AddressBookSyncResult({
-    required this.fetchedEvents,
     required this.decryptedEvents,
     required this.skippedEvents,
     required this.computedContacts,
   });
-}
-
-class AddressBookFilters {
-  final Filter contacts;
-  final Filter deletions;
-
-  const AddressBookFilters({required this.contacts, required this.deletions});
 }
 
 List<String> _stringList(Object? value) {

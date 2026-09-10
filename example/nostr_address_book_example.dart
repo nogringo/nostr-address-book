@@ -2,6 +2,7 @@ import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart';
 import 'package:nostr_address_book/nostr_address_book.dart';
 import 'package:sembast/sembast_memory.dart';
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
 Future<void> main() async {
   final database = await databaseFactoryMemory.openDatabase('example.db');
@@ -18,10 +19,12 @@ Future<void> main() async {
   ndk.accounts.loginPrivateKey(pubkey: publicKey, privkey: privateKey);
 
   final broadcastQueue = OfflineBroadcast.withNdk(ndk, db: database);
+  final syncEngine = SyncEngine(ndk, db: database)..start();
   final book = NostrAddressBook(
     ndk: ndk,
     database: database,
     broadcastQueue: broadcastQueue,
+    syncEngine: syncEngine,
   );
 
   final contact = await book.upsertVCard('''
@@ -38,8 +41,10 @@ END:VCARD
 
   print('Saved ${contact.index.formattedName} (${contact.uid})');
 
-  await book.fetchRecent();
-  await book.pull(paginate: true);
+  // Declared once: the engine keeps the cache in sync from there on, and each
+  // landed page turns into contacts.
+  await book.sync();
+  await book.refresh();
 
   final contacts = await book.list();
   print('Local contacts: ${contacts.length}');
@@ -54,6 +59,7 @@ END:VCARD
   print('Cleared local data for $publicKey');
 
   await broadcastQueue.dispose();
+  await syncEngine.dispose();
   await ndk.destroy();
   await database.close();
 }

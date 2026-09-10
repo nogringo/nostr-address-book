@@ -1,3 +1,32 @@
+## 0.4.0
+
+- Breaking: downward sync moves to `sync_engine_shim_for_ndk`. The constructor
+  requires a caller-owned `syncEngine`, shareable with the rest of the app like
+  the broadcast queue. The engine works out what is missing, fetches it into
+  the NDK cache, and revisits the recent end on its own, so the app has no
+  pagination, no `since` tracking and no polling left to write.
+- Breaking: `fetchRecent()`, `pull()`, `recentFilters()`, `recentLimit` and
+  `AddressBookFilters` are gone. `sync({pubkey})` declares an account's sync
+  and returns its handle, `refresh()` is the pull to refresh gesture,
+  `reconcile()` turns cached events into contacts, `stopSync`/`stopAllSync`
+  drop the package's interest, and `syncRequest({pubkey})` exposes what was
+  declared.
+- Breaking: `AddressBookSyncResult.fetchedEvents` is gone; the engine reports
+  pages, not events. The remaining counters cover reconciliation, background
+  passes included.
+- Breaking: `contactFilter` and `deletionFilter` lose `limit` and `uid`. The
+  engine ignores a filter `limit`, and a window is declared through
+  `since`/`until`.
+- Sync requests authenticate as their own account (NIP-42), so an address book
+  a relay serves only to its owner syncs like any other.
+- `clearLocalAccountData` and `clearAllLocalData` forget the sync coverage of
+  the address book's own filters instead of clearing NDK fetched ranges
+  globally, so other consumers no longer re-download. Coverage goes on every
+  relay a filter was synced from, current NIP-65 list or not: a cache emptied
+  under a coverage that survived is never fetched again.
+- Breaking: require `ndk: ^0.10.0-dev.1` and Dart SDK `^3.12.2`, which
+  `sync_engine_shim_for_ndk: ^0.7.0` pulls in.
+
 ## 0.3.1
 
 - Widen the ndk constraint to `>=0.9.2 <0.11.0`, so an app already on the
