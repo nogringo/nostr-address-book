@@ -1,3 +1,10 @@
+## 0.3.1
+
+- Widen the ndk constraint to `>=0.9.2 <0.11.0`, so an app already on the
+  ndk `0.10` prerelease series can depend on this package. Requires
+  `broadcast_queue_shim_for_ndk: ^0.5.1`, which widened its own constraint the
+  same way. No API change.
+
 ## 0.3.0
 
 - Breaking: require `ndk: ^0.9.2` and `broadcast_queue_shim_for_ndk: ^0.5.0`.

@@ -1,6 +1,6 @@
 name: nostr_address_book
 description: Local-first Nostr address book backed by vCard 4.0 events.
-version: 0.3.0
+version: 0.3.1
 repository: https://github.com/nogringo/nostr-address-book
 
 topics:
@@ -13,8 +13,8 @@ environment:
   sdk: ^3.12.1
 
 dependencies:
-  broadcast_queue_shim_for_ndk: ^0.5.0
-  ndk: ^0.9.2
+  broadcast_queue_shim_for_ndk: ^0.5.1
+  ndk: ">=0.9.2 <0.11.0"
   sembast: ^3.8.8+1
   uuid: ^4.5.3
   vcard_dart: ^2.1.0
