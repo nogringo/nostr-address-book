@@ -1,3 +1,11 @@
+## 0.5.0
+
+- Breaking: require `broadcast_queue_shim_for_ndk: ^0.6.0`. `upsert` and
+  `delete` queue events for the account's outbox relays, resolved by the queue
+  instead of before queueing, so they no longer wait on the network. The queue
+  needs a `relayListFn`, which `OfflineBroadcast.withNdk` provides.
+- Breaking: `getWriteRelays()` is gone.
+
 ## 0.4.0
 
 - `delete` publishes an empty version of the contact event alongside the NIP-09

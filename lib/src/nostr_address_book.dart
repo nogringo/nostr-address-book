@@ -1,5 +1,5 @@
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
-import 'package:ndk/ndk.dart';
+import 'package:ndk/ndk.dart' hide RelaySet;
 import 'package:sembast/sembast.dart' show Database;
 import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
@@ -33,6 +33,9 @@ class NostrAddressBook {
   /// broadcasts at logout is the caller's call, through
   /// [OfflineBroadcast.clearLocalAccountData] or
   /// [OfflineBroadcast.clearAllLocalData]; so is [OfflineBroadcast.dispose].
+  ///
+  /// Events are queued to the signing account's outbox relays, so the queue
+  /// needs a `relayListFn`, as [OfflineBroadcast.withNdk] provides.
   final OfflineBroadcast broadcastQueue;
 
   /// Downward sync engine keeping the NDK cache in step with the relays.
@@ -162,23 +165,6 @@ class NostrAddressBook {
     return _relayFallback(userRelayList?.readUrls ?? const []);
   }
 
-  /// Returns the relay URLs used for publishing address-book events.
-  ///
-  /// The list comes from the NIP-65 write relays of [pubkey], which defaults
-  /// to the current account, through `ndk.userRelayLists`. If no write relay
-  /// is available, the method falls back explicitly to currently connected
-  /// relays, then NDK bootstrap relays.
-  Future<List<String>> getWriteRelays({
-    String? pubkey,
-    bool forceRefresh = false,
-  }) async {
-    final userRelayList = await ndk.userRelayLists.getSingleUserRelayList(
-      pubkey ?? _requirePubkey(),
-      forceRefresh: forceRefresh,
-    );
-    return _relayFallback(userRelayList?.writeUrls ?? const []);
-  }
-
   /// Saves or updates a contact from a vCard 4.0 text payload.
   ///
   /// This method is local-first:
@@ -231,14 +217,11 @@ class NostrAddressBook {
     );
     await rebuildComputedStores();
 
-    final relays = await getWriteRelays();
-    if (relays.isNotEmpty) {
-      await broadcastQueue.broadcast(
-        event,
-        relays: relays,
-        pubkey: account.pubkey,
-      );
-    }
+    await broadcastQueue.broadcast(
+      event,
+      relaySet: RelaySet.outbox(account.pubkey),
+      pubkey: account.pubkey,
+    );
 
     final contact = await get(canonical.uid, pubkey: account.pubkey);
     if (contact == null) {
@@ -294,15 +277,12 @@ class NostrAddressBook {
     );
     await ndk.config.cache.saveEvents([tombstone, event]);
 
-    final relays = await getWriteRelays();
-    if (relays.isNotEmpty) {
-      for (final pending in [tombstone, event]) {
-        await broadcastQueue.broadcast(
-          pending,
-          relays: relays,
-          pubkey: account.pubkey,
-        );
-      }
+    for (final pending in [tombstone, event]) {
+      await broadcastQueue.broadcast(
+        pending,
+        relaySet: RelaySet.outbox(account.pubkey),
+        pubkey: account.pubkey,
+      );
     }
     await rebuildComputedStores();
   }

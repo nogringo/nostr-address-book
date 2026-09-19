@@ -124,8 +124,10 @@ under a coverage that survived is never fetched again.
 watchers, and computed-store rebuilds do not require a signer.
 
 Sync resolves the account's NIP-65 read relays through `ndk.userRelayLists`.
-Publishing resolves NIP-65 write relays the same way before queueing events in
-`broadcastQueue`.
+Publishing queues events in `broadcastQueue` for the account's outbox relays,
+which the queue resolves itself, so it needs a `relayListFn`
+(`OfflineBroadcast.withNdk` provides one). Keeping the account's NIP-65 list in
+the NDK cache is the caller's job.
 
 ## Storage
 

@@ -305,7 +305,7 @@ void main() {
       expect((await book.reconcile()).decryptedEvents, 0);
     });
 
-    test('read and write relays are resolved from NIP-65 markers', () async {
+    test('read relays are resolved from NIP-65 markers', () async {
       await _seedRelayList(ndk, signer.getPublicKey(), {
         'wss://read.example': ndk_entities.ReadWriteMarker.readOnly,
         'wss://write.example': ndk_entities.ReadWriteMarker.writeOnly,
@@ -315,10 +315,6 @@ void main() {
       expect(
         await book.getReadRelays(),
         unorderedEquals(['wss://read.example', 'wss://both.example']),
-      );
-      expect(
-        await book.getWriteRelays(),
-        unorderedEquals(['wss://write.example', 'wss://both.example']),
       );
     });
 
