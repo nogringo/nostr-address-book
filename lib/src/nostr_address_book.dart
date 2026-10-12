@@ -1,5 +1,5 @@
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
-import 'package:ndk/ndk.dart' hide RelaySet;
+import 'package:ndk/ndk.dart';
 import 'package:sembast/sembast.dart' show Database;
 import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
@@ -219,7 +219,7 @@ class NostrAddressBook {
 
     await broadcastQueue.broadcast(
       event,
-      relaySet: RelaySet.outbox(account.pubkey),
+      relaySet: UrlSet.outbox(account.pubkey),
       pubkey: account.pubkey,
     );
 
@@ -280,7 +280,7 @@ class NostrAddressBook {
     for (final pending in [tombstone, event]) {
       await broadcastQueue.broadcast(
         pending,
-        relaySet: RelaySet.outbox(account.pubkey),
+        relaySet: UrlSet.outbox(account.pubkey),
         pubkey: account.pubkey,
       );
     }

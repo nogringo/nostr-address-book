@@ -19,7 +19,8 @@ Future<void> main() async {
   ndk.accounts.loginPrivateKey(pubkey: publicKey, privkey: privateKey);
 
   final broadcastQueue = OfflineBroadcast.withNdk(ndk, db: database);
-  final syncEngine = SyncEngine(ndk, db: database)..start();
+  final syncEngine = SyncEngine(ndk, store: SembastSyncStore(database))
+    ..start();
   final book = NostrAddressBook(
     ndk: ndk,
     database: database,

@@ -36,7 +36,7 @@ void main() {
         db: db,
         perAttemptTimeout: const Duration(seconds: 1),
       );
-      engine = SyncEngine(ndk, db: db)..start();
+      engine = SyncEngine(ndk, store: SembastSyncStore(db))..start();
       book = NostrAddressBook(
         ndk: ndk,
         database: db,
@@ -608,7 +608,7 @@ void main() {
         db: db,
         perAttemptTimeout: const Duration(seconds: 1),
       );
-      engine = SyncEngine(ndk, db: db)..start();
+      engine = SyncEngine(ndk, store: SembastSyncStore(db))..start();
       book = NostrAddressBook(
         ndk: ndk,
         database: db,
@@ -633,7 +633,7 @@ void main() {
         db: db,
         perAttemptTimeout: const Duration(seconds: 1),
       );
-      engine = SyncEngine(ndk, db: db)..start();
+      engine = SyncEngine(ndk, store: SembastSyncStore(db))..start();
       book = NostrAddressBook(
         ndk: ndk,
         database: db,

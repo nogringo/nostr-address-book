@@ -1,3 +1,12 @@
+## 0.6.0
+
+- Breaking: require `sync_engine_shim_for_ndk: ^0.8.0`. `SyncEngine` takes a
+  `store` instead of a sembast `db`: pass `SembastSyncStore(database)`, which
+  reads the coverage 0.7 wrote.
+- Breaking: require `broadcast_queue_shim_for_ndk: ^0.8.0`. `RelaySet` is now
+  `UrlSet`, and `BroadcastStatus` gains `superseded` and `cancelled`.
+- Accept `ndk` from 0.10.0-dev.7 up to 0.11.
+
 ## 0.5.0
 
 - Breaking: require `broadcast_queue_shim_for_ndk: ^0.6.0`. `upsert` and

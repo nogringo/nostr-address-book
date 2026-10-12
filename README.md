@@ -21,7 +21,7 @@ vCard.
 // package only enqueues address-book events into the queue, and only declares
 // its own requests on the engine.
 final broadcastQueue = OfflineBroadcast.withNdk(ndk, db: database);
-final syncEngine = SyncEngine(ndk, db: database)..start();
+final syncEngine = SyncEngine(ndk, store: SembastSyncStore(database))..start();
 final book = NostrAddressBook(
   ndk: ndk,
   database: database,
