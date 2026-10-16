@@ -44,7 +44,7 @@ END:VCARD
 
   // Declared once: the engine keeps the cache in sync from there on, and each
   // landed page turns into contacts.
-  await book.sync();
+  book.sync();
   await book.refresh();
 
   final contacts = await book.list();

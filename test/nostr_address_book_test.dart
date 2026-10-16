@@ -305,19 +305,6 @@ void main() {
       expect((await book.reconcile()).decryptedEvents, 0);
     });
 
-    test('read relays are resolved from NIP-65 markers', () async {
-      await _seedRelayList(ndk, signer.getPublicKey(), {
-        'wss://read.example': ndk_entities.ReadWriteMarker.readOnly,
-        'wss://write.example': ndk_entities.ReadWriteMarker.writeOnly,
-        'wss://both.example': ndk_entities.ReadWriteMarker.readWrite,
-      });
-
-      expect(
-        await book.getReadRelays(),
-        unorderedEquals(['wss://read.example', 'wss://both.example']),
-      );
-    });
-
     test('same uid across accounts stays separate, deletions stay per '
         'account', () async {
       const uid = 'urn:uuid:shared';
@@ -598,6 +585,7 @@ void main() {
       relay = MockRelay(name: 'refresh sync relay');
       await relay.startServer();
       ndk = _ndkForRelay(relay.url, signer);
+      await _publishOutbox(ndk, signer.getPublicKey(), relay.url);
       await _publishContactEvents(
         ndk,
         events.map((event) => _EncryptedContact(event: event, decrypted: '')),
@@ -608,7 +596,11 @@ void main() {
         db: db,
         perAttemptTimeout: const Duration(seconds: 1),
       );
-      engine = SyncEngine(ndk, store: SembastSyncStore(db))..start();
+      engine = SyncEngine(
+        ndk,
+        store: SembastSyncStore(db),
+        discoveryRelays: [relay.url],
+      )..start();
       book = NostrAddressBook(
         ndk: ndk,
         database: db,
@@ -628,12 +620,17 @@ void main() {
       relay = MockRelay(name: 'sync handle relay');
       await relay.startServer();
       ndk = _ndkForRelay(relay.url, signer);
+      await _publishOutbox(ndk, signer.getPublicKey(), relay.url);
       queue = OfflineBroadcast.withNdk(
         ndk,
         db: db,
         perAttemptTimeout: const Duration(seconds: 1),
       );
-      engine = SyncEngine(ndk, store: SembastSyncStore(db))..start();
+      engine = SyncEngine(
+        ndk,
+        store: SembastSyncStore(db),
+        discoveryRelays: [relay.url],
+      )..start();
       book = NostrAddressBook(
         ndk: ndk,
         database: db,
@@ -641,10 +638,8 @@ void main() {
         syncEngine: engine,
       );
 
-      final handle = await book.sync();
-      expect(await book.sync(), handle);
-      // Racing declarations must not register the request twice.
-      expect((await Future.wait([book.sync(), book.sync()])).toSet(), {handle});
+      final handle = book.sync();
+      expect(book.sync(), handle);
 
       await book.refresh();
       final filter = book.contactFilter();
@@ -712,6 +707,19 @@ Ndk _ndkForRelay(String relayUrl, Bip340EventSigner signer) {
   );
   ndk.accounts.loginExternalSigner(signer: signer);
   return ndk;
+}
+
+Future<void> _publishOutbox(Ndk ndk, String pubkey, String relayUrl) async {
+  await ndk.relays.seedRelaysConnected;
+  final response = ndk.broadcast.broadcast(
+    nostrEvent: ndk_entities.Nip65(
+      pubKey: pubkey,
+      relays: {relayUrl: ndk_entities.ReadWriteMarker.writeOnly},
+      createdAt: Nip01Event.secondsSinceEpoch(),
+    ).toEvent(),
+    specificRelays: [relayUrl],
+  );
+  await response.broadcastDoneFuture;
 }
 
 Future<void> _publishContactEvents(

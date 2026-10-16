@@ -30,7 +30,7 @@ final book = NostrAddressBook(
 );
 
 // Declared once, then kept up to date without a timer of your own.
-await book.sync();
+book.sync();
 
 // Pull to refresh.
 await book.refresh();
@@ -55,9 +55,9 @@ await syncEngine.dispose();
 
 Downward sync is delegated to
 [sync_engine_shim_for_ndk](https://pub.dev/packages/sync_engine_shim_for_ndk).
-`sync()` declares the account's contact and deletion filters on its NIP-65 read
-relays; the engine works out what is missing, fetches it into the NDK cache,
-and revisits the recent end on its own. Nothing here paginates or tracks a
+`sync()` declares the account's contact and deletion filters on its NIP-65 write
+relays, where they are published; the engine works out what is missing, fetches
+it into the NDK cache, and revisits the recent end on its own. Nothing here paginates or tracks a
 `since`.
 
 The engine reports pages, never events, so each landed page is reconciled:
@@ -66,7 +66,7 @@ and the computed stores are rebuilt. `reconcile()` runs that pass on demand,
 for events that reached the cache through another path.
 
 ```dart
-final handle = await book.sync();
+final handle = book.sync();
 syncEngine.watchStatus(handle).listen((status) => print(status.phase));
 
 // Leaving the address-book screen: the engine stops spending network on it.
@@ -98,7 +98,7 @@ final onlyMine = await book.list(query: ContactQuery(pubkey: myPubkey));
 
 // Each account syncs under its own identity; reconciliation decrypts for the
 // logged one, so the others materialize when they are back.
-await book.sync(pubkey: otherPubkey);
+book.sync(pubkey: otherPubkey);
 
 // Logout: remove one account's local data (relays are untouched).
 await broadcastQueue.clearLocalAccountData(pubkey: myPubkey);
@@ -123,11 +123,12 @@ under a coverage that survived is never fetched again.
 `NostrAddressBook` uses `ndk.accounts` for signing and encryption. Local reads,
 watchers, and computed-store rebuilds do not require a signer.
 
-Sync resolves the account's NIP-65 read relays through `ndk.userRelayLists`.
-Publishing queues events in `broadcastQueue` for the account's outbox relays,
-which the queue resolves itself, so it needs a `relayListFn`
-(`OfflineBroadcast.withNdk` provides one). Keeping the account's NIP-65 list in
-the NDK cache is the caller's job.
+Both sides use the account's outbox relays, and neither resolves them up front.
+Publishing queues events in `broadcastQueue`, which resolves the relays itself,
+so it needs a `relayListFn` (`OfflineBroadcast.withNdk` provides one). The sync
+request names the same relays, which the engine looks up again on every pass
+from its `discoveryRelays`, so the sync follows the account when its list
+changes.
 
 ## Storage
 

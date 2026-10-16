@@ -84,9 +84,9 @@ class NostrAddressBook {
   /// polling to write. Every page that lands is reconciled: newly cached
   /// events are decrypted and the computed stores are rebuilt.
   ///
-  /// Calling this again is cheap and returns the same handle, unless
-  /// [getReadRelays] no longer matches the relays the request was declared on:
-  /// the previous handle is then released and a new one takes its place.
+  /// Calling this again is cheap and returns the same handle. The request
+  /// reads the account's NIP-65 list on every pass, so it follows the account
+  /// when its relays change.
   ///
   /// The request authenticates as [pubkey], which defaults to the current
   /// account. That account must be in `ndk.accounts` and able to sign, or the
@@ -95,7 +95,7 @@ class NostrAddressBook {
   /// Reconciliation decrypts only for the currently logged account, so a
   /// request declared for another account materializes its contacts when that
   /// account is back and [reconcile] runs.
-  Future<SyncHandle> sync({String? pubkey}) {
+  SyncHandle sync({String? pubkey}) {
     return _sync.declare(pubkey ?? _requirePubkey());
   }
 
@@ -136,33 +136,17 @@ class NostrAddressBook {
   /// Exposed so the caller can watch its status through
   /// `syncEngine.watchStatus`, or hand it to `syncEngine.forget`. [pubkey]
   /// defaults to the current account.
-  Future<SyncRequest> syncRequest({String? pubkey}) async {
+  SyncRequest syncRequest({String? pubkey}) {
     final target = pubkey ?? _requirePubkey();
     return SyncRequest(
       filters: [
         contactFilter(pubkey: target),
         deletionFilter(pubkey: target),
       ],
-      relays: await getReadRelays(pubkey: target),
+      // The account publishes its contacts to its outbox: read them there.
+      relays: UrlSet.outbox(target),
       authPubkey: target,
     );
-  }
-
-  /// Returns the relay URLs used for reading address-book events.
-  ///
-  /// The list comes from the NIP-65 read relays of [pubkey], which defaults to
-  /// the current account, through `ndk.userRelayLists`. If no read relay is
-  /// available, the method falls back explicitly to currently connected
-  /// relays, then NDK bootstrap relays.
-  Future<List<String>> getReadRelays({
-    String? pubkey,
-    bool forceRefresh = false,
-  }) async {
-    final userRelayList = await ndk.userRelayLists.getSingleUserRelayList(
-      pubkey ?? _requirePubkey(),
-      forceRefresh: forceRefresh,
-    );
-    return _relayFallback(userRelayList?.readUrls ?? const []);
   }
 
   /// Saves or updates a contact from a vCard 4.0 text payload.
@@ -656,17 +640,6 @@ class NostrAddressBook {
     // NIP-09: only the author may delete their own addressable events.
     if (parts[1] != author) return null;
     return parts.sublist(2).join(':');
-  }
-
-  List<String> _relayFallback(Iterable<String> preferredRelays) {
-    final relays = preferredRelays.toSet();
-    if (relays.isEmpty) {
-      relays.addAll(ndk.relays.connectedRelays.map((relay) => relay.url));
-    }
-    if (relays.isEmpty) {
-      relays.addAll(ndk.config.bootstrapRelays);
-    }
-    return relays.where((relay) => relay.trim().isNotEmpty).toList();
   }
 
   Account _requireAccount() {

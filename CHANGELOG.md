@@ -1,3 +1,18 @@
+## 0.7.0
+
+- Breaking: require `sync_engine_shim_for_ndk: ^0.9.1`. The engine keeps the
+  dates of its relay list fetches in the same `SembastSyncStore`.
+- Sync reads from the account's NIP-65 write relays, where `upsert` and
+  `delete` publish, instead of its read relays: an account with separate read
+  and write relays never got its contacts back.
+- The sync request reads that list on every pass, so it follows the account
+  when its relays change. There is no fallback any more, to the connected or
+  bootstrap relays: an account without a list has published nothing, so its
+  request reports `synced` until the list names relays.
+- Breaking: `sync()` and `syncRequest()` are synchronous, and return a
+  `SyncHandle` and a `SyncRequest`.
+- Breaking: `getReadRelays()` is gone.
+
 ## 0.6.0
 
 - Breaking: require `sync_engine_shim_for_ndk: ^0.8.0`. `SyncEngine` takes a
